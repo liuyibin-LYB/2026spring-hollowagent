@@ -1,5 +1,39 @@
 # 更新日志 (CHANGELOG)
 
+
+**改动总结1st**
+1. **模式 2 多轮对话**
+- 新增 `_conversation_history` / `_conversation_searched_posts` 实例属性，跨轮次持久化
+- 新增 `mode_auto_search_multi_turn()` — 每次追加 user 消息到同一个 [messages]，LLM 可按需决定是否再搜索
+- 新增 `reset_conversation()` 清空对话
+- [interactive_mode] 中模式 2 改为内层 `while True` 循环，支持 `/reset` 和 `/quit` 命令
+- 原单轮 [mode_auto_search()] 保留，供 email_bot 等非交互场景使用
+
+2. **随机延迟模拟真人**
+- config 中 [SEARCH_DELAY = 1.0] → `SEARCH_DELAY_MIN / MAX` + `COMMENT_DELAY_MIN / MAX` 两组区间
+- 新增 `_human_delay(min_s, max_s, label)` 方法，用 [random.uniform] 生成随机延迟并打印日志
+- **所有树洞 API 调用前**都加了随机延迟：
+    - 搜索请求：1.0~3.0s
+    - 评论分页：0.3~1.0s
+    - 搜索间隔额外 jitter：0.3~1.0s
+
+3. **代码重构**
+- 提取 `SEARCH_TOOL` 和 `_AUTO_SEARCH_SYSTEM_PROMPT` 为类常量，避免重复定义
+- 提取 `_execute_search_loop()` 方法，消除 [mode_auto_search] 和 `mode_auto_search_multi_turn` 的搜索循环代码重复
+
+**修改汇总2nd（[agent.py]）：**
+1. **新增 [from datetime import datetime] 导入**
+2. **新增 [CONVERSATION_FILE] 常量** — 路径为 [data/conversation_history.json]
+3. **新增 [save_conversation()]** — 将 [_conversation_history] 和 [_conversation_search_count] 序列化为 JSON
+4. **新增 [load_conversation()]** — 启动时从磁盘恢复对话，返回是否成功
+5. **[reset_conversation()] 增加归档** — 旧记录自动重命名为 [conversation_history_YYYYMMDD_HHMMSS.json]，不会丢失
+6. **模式 2 交互逻辑改进**：
+    - 进入时自动检测并提示是否恢复上次对话
+    - `/quit` 退出时自动存档
+    - 新增 `/save` 手动存档命令
+    - `/reset` 归档旧记录后重置
+
+
 ## [v2.0.0] - 2026-02-23
 
 ### 🚀 新功能: 智能迭代检索（MCP-like Function Calling）

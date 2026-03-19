@@ -32,6 +32,7 @@ treehole-web-server.service
 WEB_SERVER_README.md
 
 # Virtual environment
+.venv/
 venv/
 env/
 ENV/

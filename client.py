@@ -40,12 +40,12 @@ class TreeholeClient:
         
         Args:
             cookies_file (str): Path to the cookies file for session persistence.
-                              If None, defaults to ~/.treehole_cookies.json
+                              If None, defaults to <project>/.treehole_cookies.json
         """
         self.session = requests.Session()
-        # Use absolute path in home directory by default for consistency
+        # Use project directory by default for consistency
         if cookies_file is None:
-            cookies_file = os.path.expanduser("~/.treehole_cookies.json")
+            cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".treehole_cookies.json")
         self.cookies_file = cookies_file
         self.session.headers.update(
             {

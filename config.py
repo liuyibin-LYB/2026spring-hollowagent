@@ -5,6 +5,10 @@ Copy this file to config_private.py and fill in your credentials.
 config_private.py is gitignored for security.
 """
 
+import os
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ==================== Treehole Credentials ====================
 # Your PKU credentials for Treehole login
 USERNAME = "2xx00xxxxx"  # Replace with your student ID
@@ -38,8 +42,13 @@ TEMPERATURE = 0.7
 MAX_RESPONSE_TOKENS = 4096
 
 # ==================== Rate Limiting ====================
-# Delay between search requests (seconds)
-SEARCH_DELAY = 1.0
+# Delay between search requests (seconds) — random uniform in [MIN, MAX]
+SEARCH_DELAY_MIN = 1.0
+SEARCH_DELAY_MAX = 3.0
+
+# Delay between comment page fetches (seconds)
+COMMENT_DELAY_MIN = 0.3
+COMMENT_DELAY_MAX = 1.0
 
 # Maximum retries for failed requests
 MAX_RETRIES = 3
@@ -49,7 +58,7 @@ MAX_RETRIES = 3
 ENABLE_CACHE = True
 
 # Cache directory
-CACHE_DIR = "data/cache"
+CACHE_DIR = os.path.join(PROJECT_DIR, "data", "cache")
 
 # Cache expiration time (seconds), 1 day = 86400
 CACHE_EXPIRATION = 86400

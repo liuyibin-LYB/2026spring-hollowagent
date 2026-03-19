@@ -1,15 +1,18 @@
 """
 PKU Treehole RAG Agent
 
-Main agent class implementing two retrieval modes:
+Main agent class implementing retrieval modes:
 1. Manual keyword search: User provides keywords directly
-2. Auto keyword extraction: LLM extracts keywords from user query
+2. Auto keyword extraction: LLM extracts keywords from user query (multi-turn)
+3. Course review analysis
 """
 
 import json
 import os
+import random
 import re
 import time
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 import requests
@@ -29,6 +32,12 @@ from utils import (
 # Agent debug message prefix
 AGENT_PREFIX = "[Agent] "
 
+# Project root directory (stable regardless of current working directory)
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Conversation history persistence file
+CONVERSATION_FILE = os.path.join(PROJECT_DIR, "data", "conversation_history.json")
+
 try:
     from config_private import (
         USERNAME,
@@ -42,7 +51,10 @@ try:
         MAX_SEARCH_ITERATIONS,
         TEMPERATURE,
         MAX_RESPONSE_TOKENS,
-        SEARCH_DELAY,
+        SEARCH_DELAY_MIN,
+        SEARCH_DELAY_MAX,
+        COMMENT_DELAY_MIN,
+        COMMENT_DELAY_MAX,
         ENABLE_CACHE,
         CACHE_DIR,
         CACHE_EXPIRATION,
@@ -60,11 +72,18 @@ except ImportError:
         MAX_SEARCH_ITERATIONS,
         TEMPERATURE,
         MAX_RESPONSE_TOKENS,
-        SEARCH_DELAY,
+        SEARCH_DELAY_MIN,
+        SEARCH_DELAY_MAX,
+        COMMENT_DELAY_MIN,
+        COMMENT_DELAY_MAX,
         ENABLE_CACHE,
         CACHE_DIR,
         CACHE_EXPIRATION,
     )
+
+# Normalize cache path to an absolute path under project root when configured as relative.
+if not os.path.isabs(CACHE_DIR):
+    CACHE_DIR = os.path.join(PROJECT_DIR, CACHE_DIR)
 
 
 class TreeholeRAGAgent:
@@ -73,9 +92,53 @@ class TreeholeRAGAgent:
     Supports manual and automatic keyword-based retrieval.
     """
 
+    # ------------------------------------------------------------------ #
+    #                        Search tool definition                       #
+    # ------------------------------------------------------------------ #
+    SEARCH_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "search_treehole",
+            "description": "在北大树洞中搜索相关帖子。如果当前信息不足以回答问题，可以使用不同的关键词多次调用此函数。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "搜索关键词，精准的1-2个词，不要包含多个概念"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "为什么需要搜索这个关键词（可选）"
+                    }
+                },
+                "required": ["keyword"]
+            }
+        }
+    }
+
+    # System prompt shared by mode_auto_search and multi-turn conversation
+    _AUTO_SEARCH_SYSTEM_PROMPT = (
+        "你是一个北大树洞问答助手。你可以通过调用 search_treehole 函数来搜索树洞中的相关内容。\n\n"
+        "工作流程：\n"
+        "1. 分析用户问题，确定最核心的搜索关键词\n"
+        "2. 调用 search_treehole，关键词之间用空格连接\n"
+        "3. 分析搜索结果，判断信息是否足够\n"
+        "4. 如果信息不足，可以换用不同的关键词再次搜索\n"
+        "5. 信息充足后，基于所有搜索结果回答用户问题\n\n"
+        "注意事项：\n"
+        "- 每次调用只搜索1-2个关键词，且最好拆分为最基本的概念，"
+        "例如\"户外探索给分\"拆分为\"户外探索 给分\"\n"
+        "- 只基于搜索到的树洞内容回答，不要编造信息\n"
+        "- 搜索次数建议不超过 {half_iter} 次\n"
+        "- 如果树洞内容不足以回答问题，诚实地告知用户\n"
+        "- 保持客观，综合多个观点\n"
+        "- 在多轮对话中，你可以利用之前搜索过的内容继续回答追问"
+    )
+
     def __init__(self, interactive=True, cookies_file=None):
         """Initialize the agent with Treehole client and DeepSeek API.
-        
+
         Args:
             interactive (bool): Whether to allow interactive prompts for login verification.
                               Set to False when running as a service.
@@ -87,83 +150,90 @@ class TreeholeRAGAgent:
         self.model = DEEPSEEK_MODEL
         self._all_comments_cache: Dict[int, List[Dict[str, Any]]] = {}
         self.stream_callback = None  # Optional callback for streaming output
-        self.info_callback = None  # Callback for progress/info messages
-        
+        self.info_callback = None    # Callback for progress/info messages
+
+        # Multi-turn conversation state (mode 2)
+        self._conversation_history: List[Dict[str, Any]] = []
+        self._conversation_searched_posts: List[Dict[str, Any]] = []
+        self._conversation_search_count: int = 0
+
         # Ensure login
         if not self.client.ensure_login(USERNAME, PASSWORD, interactive=interactive):
             raise RuntimeError("Failed to login to Treehole. Try running interactively first to save cookies.")
-        
+
         # Create cache directory
         if ENABLE_CACHE:
             os.makedirs(CACHE_DIR, exist_ok=True)
-        
+
         print(f"{AGENT_PREFIX}✓ 树洞 RAG Agent 初始化成功")
 
+    # ------------------------------------------------------------------ #
+    #                        Random delay helpers                         #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _human_delay(min_s: float, max_s: float, label: str = "") -> float:
+        """Sleep for a random duration to simulate human browsing.
+
+        Args:
+            min_s: Minimum delay in seconds.
+            max_s: Maximum delay in seconds.
+            label: Optional label for debug output.
+
+        Returns:
+            The actual delay applied (seconds).
+        """
+        delay = random.uniform(min_s, max_s)
+        if label:
+            print(f"{AGENT_PREFIX}⏳ {label}: 等待 {delay:.2f}s")
+        time.sleep(delay)
+        return delay
+
+    # ------------------------------------------------------------------ #
+    #                        Treehole search                              #
+    # ------------------------------------------------------------------ #
+
     def search_treehole(
-        self, 
-        keyword: str, 
+        self,
+        keyword: str,
         max_results: int = MAX_SEARCH_RESULTS,
         use_cache: bool = ENABLE_CACHE
     ) -> List[Dict[str, Any]]:
         """
         Search Treehole for posts matching keyword.
-        
-        Args:
-            keyword (str): Search keyword.
-            max_results (int): Maximum number of results to return.
-            use_cache (bool): Whether to use cached results.
-            
-        Returns:
-            list: List of post dictionaries.
         """
         # Check cache first
         if use_cache:
             cache_key = get_cache_key(keyword)
             cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
-            
+
             if is_cache_valid(cache_file, CACHE_EXPIRATION):
                 print(f"{AGENT_PREFIX}使用缓存结果: {keyword}")
                 return load_json(cache_file)
-        
+
         print(f"{AGENT_PREFIX}正在搜索树洞: {keyword}")
-        
-        # Call search API
+
+        # Random delay before hitting the search API
+        self._human_delay(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX, "搜索请求")
+
         try:
             search_result = self.client.search_posts(
-                keyword, 
+                keyword,
                 limit=max_results,
-                comment_limit=10  # Get up to 10 comments per post from the search API
+                comment_limit=10
             )
-            
+
             if search_result.get("success"):
                 posts = search_result["data"]["data"]
-                
-                # The search API already includes comments in comment_list
-                # We just need to ensure the format is consistent
-                enriched_posts = []
-                for post in posts[:max_results]:
-                    # Comments are already included from the search API
-                    # If you need ALL comments (not just the preview), uncomment below:
-                    # if post.get("comment_total", 0) > len(post.get("comments", [])):
-                    #     # Fetch all comments if needed
-                    #     try:
-                    #         comments_result = self.client.get_comment(post["pid"])
-                    #         if comments_result.get("success"):
-                    #             post["comments"] = comments_result["data"]["data"]
-                    #     except Exception as e:
-                    #         print(f"Warning: Failed to fetch all comments for post {post.get('pid')}: {e}")
-                    
-                    enriched_posts.append(post)
-                
-                # Cache results
+                enriched_posts = list(posts[:max_results])
+
                 if use_cache:
                     save_json(enriched_posts, cache_file)
-                
+
                 msg = f"✓ 找到 {len(enriched_posts)} 个帖子"
                 print(f"{AGENT_PREFIX}{msg}")
                 if self.info_callback:
                     self.info_callback(msg)
-                
                 return enriched_posts
             else:
                 msg = f"搜索失败: {search_result.get('message', '未知错误')}"
@@ -171,17 +241,18 @@ class TreeholeRAGAgent:
                 if self.info_callback:
                     self.info_callback(msg)
                 return []
-                
+
         except Exception as e:
             print(f"{AGENT_PREFIX}搜索树洞时出错: {e}")
             return []
 
+    # ------------------------------------------------------------------ #
+    #                     Utility / parsing helpers                       #
+    # ------------------------------------------------------------------ #
+
     @staticmethod
     def parse_teacher_input(teacher_input: str) -> List[str]:
-        """
-        Parse teacher input string to a deduplicated list.
-        Supports separators: comma/space/Chinese comma/slash/semicolon.
-        """
+        """Parse teacher input string to a deduplicated list."""
         if not teacher_input:
             return []
         tokens = re.split(r"[,\s，、/;；]+", teacher_input.strip())
@@ -196,17 +267,12 @@ class TreeholeRAGAgent:
 
     @staticmethod
     def _contains_keyword(text: str, keyword: str) -> bool:
-        """
-        Case-insensitive containment check for mixed Chinese/English text.
-        Empty keyword always matches.
-        """
         if not keyword:
             return True
         return keyword.lower() in (text or "").lower()
 
     @staticmethod
     def _build_course_search_keyword(course_abbr: str, teacher_keyword: str) -> str:
-        """Build search query for course review."""
         parts = [course_abbr]
         if teacher_keyword:
             parts.append(teacher_keyword)
@@ -214,10 +280,7 @@ class TreeholeRAGAgent:
         return " ".join(parts)
 
     def _fetch_all_comments_for_post(self, post: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Fetch all comments for a post, using in-memory cache to avoid
-        repeated network calls across multi-teacher comparisons.
-        """
+        """Fetch all comments for a post, with random delay between pages."""
         pid = post.get("pid")
         if not pid:
             return post.get("comments") or post.get("comment_list") or []
@@ -231,12 +294,17 @@ class TreeholeRAGAgent:
 
         if comment_total > len(existing_comments):
             print(f"{AGENT_PREFIX}  正在获取帖子 #{pid} 的全部 {comment_total} 条评论...")
+
+            # Random delay before first comment fetch
+            self._human_delay(COMMENT_DELAY_MIN, COMMENT_DELAY_MAX, f"获取 #{pid} 评论")
             comments_result = self.client.get_comment(pid, limit=100)
 
             if comments_result.get("success"):
                 all_comments = comments_result["data"]["data"]
                 last_page = comments_result["data"].get("last_page", 1)
                 for page in range(2, last_page + 1):
+                    # Random delay between comment pages
+                    self._human_delay(COMMENT_DELAY_MIN, COMMENT_DELAY_MAX, f"#{pid} 评论第{page}页")
                     page_result = self.client.get_comment(pid, page=page, limit=100)
                     if page_result.get("success"):
                         all_comments.extend(page_result["data"]["data"])
@@ -252,9 +320,7 @@ class TreeholeRAGAgent:
         course_abbr: str,
         teacher_keyword: str = "",
     ) -> List[Dict[str, Any]]:
-        """
-        Extract course reviews from posts/comments with optional teacher filter.
-        """
+        """Extract course reviews from posts/comments with optional teacher filter."""
         course_reviews: List[Dict[str, Any]] = []
         seen_reviews = set()
 
@@ -276,14 +342,12 @@ class TreeholeRAGAgent:
             post_relevant = post_has_course and post_has_teacher
 
             if post_relevant:
-                add_review(
-                    {
-                        "pid": pid,
-                        "type": "post",
-                        "text": post_text,
-                        "is_lz": True,
-                    }
-                )
+                add_review({
+                    "pid": pid,
+                    "type": "post",
+                    "text": post_text,
+                    "is_lz": True,
+                })
 
             try:
                 comments = self._fetch_all_comments_for_post(post)
@@ -304,17 +368,16 @@ class TreeholeRAGAgent:
                         include_comment = True
 
                     if include_comment:
-                        add_review(
-                            {
-                                "pid": pid,
-                                "type": "comment",
-                                "text": comment_text,
-                                "is_lz": is_lz,
-                                "name_tag": comment.get("name_tag", "Anonymous"),
-                            }
-                        )
+                        add_review({
+                            "pid": pid,
+                            "type": "comment",
+                            "text": comment_text,
+                            "is_lz": is_lz,
+                            "name_tag": comment.get("name_tag", "Anonymous"),
+                        })
 
-                time.sleep(0.05)  # Small delay between requests
+                # Random delay between processing posts (comment fetching)
+                self._human_delay(COMMENT_DELAY_MIN, COMMENT_DELAY_MAX, f"帖子 #{pid} 处理间隔")
 
             except Exception as e:
                 print(f"{AGENT_PREFIX}  警告: 获取帖子 {pid} 的评论失败: {e}")
@@ -322,39 +385,28 @@ class TreeholeRAGAgent:
 
         return course_reviews
 
+    # ------------------------------------------------------------------ #
+    #                        DeepSeek API calls                           #
+    # ------------------------------------------------------------------ #
+
     def call_deepseek(
-        self, 
-        user_message: str, 
+        self,
+        user_message: str,
         system_message: Optional[str] = None,
         temperature: float = TEMPERATURE,
         stream: bool = True,
         callback: Optional[callable] = None
     ) -> str:
-        """
-        Call DeepSeek API for chat completion.
-        
-        Args:
-            user_message (str): User's message.
-            system_message (str): System message (optional).
-            temperature (float): Temperature for generation.
-            stream (bool): Whether to use streaming output.
-            callback (callable): Optional callback function for streaming chunks.
-            
-        Returns:
-            str: LLM response (accumulated if streaming).
-        """
+        """Call DeepSeek API for chat completion."""
         messages = []
-        
         if system_message:
             messages.append({"role": "system", "content": system_message})
-        
         messages.append({"role": "user", "content": user_message})
-        
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        
         data = {
             "model": self.model,
             "messages": messages,
@@ -362,10 +414,9 @@ class TreeholeRAGAgent:
             "max_tokens": MAX_RESPONSE_TOKENS,
             "stream": stream,
         }
-        
+
         try:
             if stream:
-                # Streaming response
                 response = requests.post(
                     f"{self.api_base}/chat/completions",
                     headers=headers,
@@ -374,7 +425,7 @@ class TreeholeRAGAgent:
                     stream=True,
                 )
                 response.raise_for_status()
-                
+
                 full_content = ""
                 for line in response.iter_lines():
                     if line:
@@ -389,7 +440,6 @@ class TreeholeRAGAgent:
                                     delta = chunk['choices'][0].get('delta', {})
                                     content = delta.get('content', '')
                                     if content:
-                                        # Use instance callback first, then parameter callback
                                         cb = self.stream_callback or callback
                                         if cb:
                                             cb(content)
@@ -398,12 +448,11 @@ class TreeholeRAGAgent:
                                         full_content += content
                             except json.JSONDecodeError:
                                 continue
-                
+
                 if not (self.stream_callback or callback):
-                    print()  # New line after streaming
+                    print()
                 return full_content
             else:
-                # Non-streaming response
                 response = requests.post(
                     f"{self.api_base}/chat/completions",
                     headers=headers,
@@ -413,48 +462,203 @@ class TreeholeRAGAgent:
                 response.raise_for_status()
                 result = response.json()
                 return result["choices"][0]["message"]["content"]
-            
+
         except Exception as e:
             print(f"{AGENT_PREFIX}调用 DeepSeek API 时出错: {e}")
             return f"抱歉，调用 DeepSeek API 时出错: {e}"
 
+    def _call_deepseek_with_tools(self, messages: List[Dict], tools: List[Dict], stream: bool = False) -> Dict:
+        """Call DeepSeek API with function calling support."""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": TEMPERATURE,
+            "max_tokens": MAX_RESPONSE_TOKENS,
+            "stream": stream,
+        }
+        if tools:
+            data["tools"] = tools
+            data["tool_choice"] = "auto"
+
+        try:
+            if stream:
+                response = requests.post(
+                    f"{self.api_base}/chat/completions",
+                    headers=headers,
+                    json=data,
+                    timeout=120,
+                    stream=True,
+                )
+                response.raise_for_status()
+
+                full_content = ""
+                tool_calls_raw = None
+
+                for line in response.iter_lines():
+                    if line:
+                        line_str = line.decode('utf-8')
+                        if line_str.startswith('data: '):
+                            data_str = line_str[6:]
+                            if data_str.strip() == '[DONE]':
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                if 'choices' in chunk and len(chunk['choices']) > 0:
+                                    delta = chunk['choices'][0].get('delta', {})
+                                    if delta.get('tool_calls') and tool_calls_raw is None:
+                                        tool_calls_raw = delta['tool_calls']
+                                    content = delta.get('content', '')
+                                    if content:
+                                        if self.stream_callback:
+                                            self.stream_callback(content)
+                                        else:
+                                            print(content, end='', flush=True)
+                                        full_content += content
+                            except json.JSONDecodeError:
+                                continue
+
+                if tool_calls_raw:
+                    return {"content": None, "tool_calls": tool_calls_raw}
+                return {"content": full_content, "tool_calls": None}
+            else:
+                response = requests.post(
+                    f"{self.api_base}/chat/completions",
+                    headers=headers,
+                    json=data,
+                    timeout=120,
+                )
+                response.raise_for_status()
+                result = response.json()
+                choice = result["choices"][0]
+                message = choice["message"]
+                return {
+                    "content": message.get("content"),
+                    "tool_calls": message.get("tool_calls"),
+                }
+
+        except requests.exceptions.HTTPError as e:
+            error_detail = ""
+            try:
+                error_detail = e.response.json().get("error", {}).get("message", e.response.text)
+            except Exception:
+                error_detail = str(e)
+            print(f"{AGENT_PREFIX}错误: DeepSeek API 调用失败 - {error_detail}")
+            return {"content": None, "tool_calls": None}
+        except Exception as e:
+            print(f"{AGENT_PREFIX}错误: DeepSeek API 调用失败 - {e}")
+            return {"content": None, "tool_calls": None}
+
+    # ------------------------------------------------------------------ #
+    #         Internal: execute one round of search-then-answer           #
+    # ------------------------------------------------------------------ #
+
+    def _execute_search_loop(
+        self,
+        messages: List[Dict],
+        all_searched_posts: List[Dict],
+        search_history: List[Dict],
+        search_count: int,
+        max_searches: int,
+    ) -> int:
+        """Run the iterative search loop, mutating *messages*, *all_searched_posts*
+        and *search_history* in-place.  Returns updated search_count."""
+
+        while search_count < max_searches:
+            response = self._call_deepseek_with_tools(messages, [self.SEARCH_TOOL], stream=False)
+
+            if response.get("tool_calls"):
+                for tool_call in response["tool_calls"]:
+                    if tool_call["function"]["name"] == "search_treehole":
+                        search_count += 1
+                        args = json.loads(tool_call["function"]["arguments"])
+                        keyword = args.get("keyword", "")
+                        reason = args.get("reason", "")
+
+                        search_history.append({
+                            "iteration": search_count,
+                            "keyword": keyword,
+                            "reason": reason,
+                        })
+
+                        # Temporarily disable info_callback to avoid duplicate output
+                        temp_callback = self.info_callback
+                        self.info_callback = None
+
+                        posts = self.search_treehole(keyword, max_results=min(MAX_SEARCH_RESULTS, 30))
+                        all_searched_posts.extend(posts)
+
+                        self.info_callback = temp_callback
+
+                        search_msg = f"[第{search_count}次搜索] 关键词: {keyword}"
+                        if reason:
+                            search_msg += f"\n搜索原因: {reason}"
+                        search_msg += f"\n✓ 找到 {len(posts)} 个帖子"
+                        print(f"\n{AGENT_PREFIX}{search_msg}")
+                        if self.info_callback:
+                            self.info_callback(search_msg)
+
+                        # Format for LLM
+                        if posts:
+                            context_posts = smart_truncate_posts(posts[:30], max_comments=MAX_COMMENTS_PER_POST, max_tokens=8192)
+                            context_text = format_posts_batch(context_posts, include_comments=True, max_comments=MAX_COMMENTS_PER_POST)
+                            result_summary = f"搜索到 {len(posts)} 个帖子。以下是前 {len(context_posts)} 个：\n\n{context_text}"
+                        else:
+                            result_summary = f"未找到关于「{keyword}」的相关帖子。"
+
+                        assistant_msg: Dict[str, Any] = {
+                            "role": "assistant",
+                            "tool_calls": response["tool_calls"],
+                        }
+                        if response.get("content"):
+                            assistant_msg["content"] = response["content"]
+                        messages.append(assistant_msg)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": "search_treehole",
+                            "content": result_summary,
+                        })
+
+                        # Random delay between searches (already done inside search_treehole,
+                        # but add a small extra jitter here)
+                        self._human_delay(0.3, 1.0, "搜索间隔")
+                continue
+            else:
+                break
+
+        return search_count
+
+    # ------------------------------------------------------------------ #
+    #                  Mode 1: Manual keyword search                      #
+    # ------------------------------------------------------------------ #
+
     def mode_manual_search(self, keyword: str, user_question: str) -> Dict[str, Any]:
-        """
-        Mode 1: Manual keyword search.
-        User provides keyword directly, agent searches and answers.
-        
-        Args:
-            keyword (str): Search keyword provided by user.
-            user_question (str): User's question.
-            
-        Returns:
-            dict: Response containing answer and sources.
-        """
+        """Mode 1: Manual keyword search."""
         print_header("模式 1: 手动关键词检索")
-        
-        # Step 1: Search Treehole
+
         posts = self.search_treehole(keyword)
-        
         if not posts:
             return {
                 "answer": f"抱歉，没有找到关于「{keyword}」的相关树洞内容。",
                 "keyword": keyword,
                 "sources": [],
             }
-        
+
         msg = f"✓ 找到 {len(posts)} 个帖子"
         print(f"{AGENT_PREFIX}{msg}")
         if self.info_callback:
             self.info_callback(msg)
-        
-        # Step 2: Select top posts for context (increased token limit)
+
         context_posts = smart_truncate_posts(posts[:MAX_CONTEXT_POSTS], max_comments=MAX_COMMENTS_PER_POST, max_tokens=10000)
         msg = f"✓ 使用 {len(context_posts)} 个帖子作为上下文"
         print(f"{AGENT_PREFIX}{msg}")
         if self.info_callback:
             self.info_callback(msg)
-        
-        # Step 3: Display retrieved content
+
         print_separator("-")
         print("\n【检索到的内容】\n")
         for i, post in enumerate(context_posts, 1):
@@ -464,11 +668,9 @@ class TreeholeRAGAgent:
                 comment_info = f"前{MAX_COMMENTS_PER_POST}条" if MAX_COMMENTS_PER_POST > 0 else "全部"
                 print(f"   评论数: {len(comments)} ({comment_info})")
         print_separator("-")
-        
-        # Step 4: Format posts as text
+
         context_text = format_posts_batch(context_posts, include_comments=True, max_comments=MAX_COMMENTS_PER_POST)
-        
-        # Step 5: Construct prompt
+
         system_message = """你是一个北大树洞问答助手。你的任务是根据提供的树洞帖子内容，回答用户的问题。
 
 注意事项：
@@ -488,10 +690,9 @@ class TreeholeRAGAgent:
 
 请基于以上树洞内容回答用户的问题。"""
 
-        # Step 6: Call LLM with streaming
         print("\n【LLM回答】\n")
         answer = self.call_deepseek(user_message, system_message, stream=True)
-        
+
         return {
             "answer": answer,
             "keyword": keyword,
@@ -499,183 +700,53 @@ class TreeholeRAGAgent:
             "num_sources": len(context_posts),
         }
 
+    # ------------------------------------------------------------------ #
+    #              Mode 2: Auto search (single-shot, legacy)              #
+    # ------------------------------------------------------------------ #
+
     def mode_auto_search(self, user_question: str) -> Dict[str, Any]:
-        """
-        Mode 2: Automatic keyword extraction with intelligent iterative search.
-        LLM can decide to search multiple times until satisfied.
-        
-        Args:
-            user_question (str): User's question.
-            
-        Returns:
-            dict: Response containing answer and sources.
-        """
+        """Mode 2 (single-shot): Automatic keyword extraction with iterative search."""
         print_header("模式 2: 智能自动检索（支持多轮搜索）")
-        
-        # Define the search tool for LLM
-        search_tool = {
-            "type": "function",
-            "function": {
-                "name": "search_treehole",
-                "description": "在北大树洞中搜索相关帖子。如果当前信息不足以回答问题，可以使用不同的关键词多次调用此函数。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "keyword": {
-                            "type": "string",
-                            "description": "搜索关键词，精准的1-2个词，不要包含多个概念"
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "为什么需要搜索这个关键词（可选）"
-                        }
-                    },
-                    "required": ["keyword"]
-                }
-            }
-        }
-        
-        # Initialize conversation
+
         messages = [
             {
                 "role": "system",
-                "content": f"""你是一个北大树洞问答助手。你可以通过调用 search_treehole 函数来搜索树洞中的相关内容。
-
-工作流程：
-1. 分析用户问题，确定最核心的搜索关键词
-2. 调用 search_treehole，关键词之间用空格连接
-3. 分析搜索结果，判断信息是否足够
-4. 如果信息不足，可以换用不同的关键词再次搜索
-5. 信息充足后，基于所有搜索结果回答用户问题
-
-注意事项：
-- 每次调用只搜索1-2个关键词，且最好拆分为最基本的概念，例如"户外探索给分"拆分为"户外探索 给分"
-- 只基于搜索到的树洞内容回答，不要编造信息
-- 搜索次数建议不超过 {MAX_SEARCH_ITERATIONS/2} 次
-- 如果树洞内容不足以回答问题，诚实地告知用户
-- 保持客观，综合多个观点"""
+                "content": self._AUTO_SEARCH_SYSTEM_PROMPT.format(half_iter=MAX_SEARCH_ITERATIONS / 2),
             },
-            {
-                "role": "user",
-                "content": f"用户问题：{user_question}"
-            }
+            {"role": "user", "content": f"用户问题：{user_question}"},
         ]
-        
-        all_searched_posts = []
-        search_history = []  # 记录搜索历史
-        search_count = 0
-        max_searches = MAX_SEARCH_ITERATIONS
-        
+
+        all_searched_posts: List[Dict[str, Any]] = []
+        search_history: List[Dict] = []
+
         msg = "✓ LLM 开始分析问题..."
         print(f"{AGENT_PREFIX}{msg}")
         if self.info_callback:
             self.info_callback(msg)
-        
-        # Iterative search loop
-        while search_count < max_searches:
-            # Call LLM with function calling
-            response = self._call_deepseek_with_tools(messages, [search_tool], stream=False)
-            
-            # Check if LLM wants to use the search tool
-            if response.get("tool_calls"):
-                for tool_call in response["tool_calls"]:
-                    if tool_call["function"]["name"] == "search_treehole":
-                        search_count += 1
-                        import json
-                        args = json.loads(tool_call["function"]["arguments"])
-                        keyword = args.get("keyword", "")
-                        reason = args.get("reason", "")
-                        
-                        # 记录搜索历史
-                        search_history.append({
-                            "iteration": search_count,
-                            "keyword": keyword,
-                            "reason": reason
-                        })
-                        
-                        # 临时禁用info_callback，避免search_treehole内部重复输出
-                        temp_callback = self.info_callback
-                        self.info_callback = None
-                        
-                        # Perform search - 每次搜索30个帖子（不再按总次数平均分配）
-                        posts = self.search_treehole(keyword, max_results=min(MAX_SEARCH_RESULTS, 30))
-                        all_searched_posts.extend(posts)
-                        
-                        # 恢复info_callback
-                        self.info_callback = temp_callback
-                        
-                        # 合并搜索信息到一个消息
-                        search_msg = f"[第{search_count}次搜索] 关键词: {keyword}"
-                        if reason:
-                            search_msg += f"\n搜索原因: {reason}"
-                        search_msg += f"\n✓ 找到 {len(posts)} 个帖子"
-                        
-                        print(f"\n{AGENT_PREFIX}{search_msg}")
-                        if self.info_callback:
-                            self.info_callback(search_msg)
-                        
-                        # Format search results for LLM
-                        if posts:
-                            # 增加token限制以包含更多帖子
-                            context_posts = smart_truncate_posts(posts[:30], max_comments=MAX_COMMENTS_PER_POST, max_tokens=8192)
-                            context_text = format_posts_batch(context_posts, include_comments=True, max_comments=MAX_COMMENTS_PER_POST)
-                            result_summary = f"搜索到 {len(posts)} 个帖子。以下是前 {len(context_posts)} 个：\n\n{context_text}"
-                        else:
-                            result_summary = f"未找到关于「{keyword}」的相关帖子。"
-                        
-                        # Add assistant's tool call and tool result to messages
-                        # Note: omit 'content' key entirely when None (some API versions reject null)
-                        assistant_msg = {
-                            "role": "assistant",
-                            "tool_calls": response["tool_calls"]
-                        }
-                        if response.get("content"):
-                            assistant_msg["content"] = response["content"]
-                        messages.append(assistant_msg)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": "search_treehole",
-                            "content": result_summary
-                        })
-                        
-                        time.sleep(SEARCH_DELAY)
-                
-                # Continue the loop to let LLM decide next action
-                continue
-            else:
-                # LLM doesn't want to search anymore, prepare for final answer
-                break
-        else:
-            # Max searches reached
-            pass
-        
-        # Deduplicate all searched posts
-        unique_posts = {post["pid"]: post for post in all_searched_posts}.values()
-        unique_posts = list(unique_posts)
-        
+
+        search_count = self._execute_search_loop(
+            messages, all_searched_posts, search_history, 0, MAX_SEARCH_ITERATIONS
+        )
+
+        unique_posts = list({p["pid"]: p for p in all_searched_posts}.values())
         msg = f"✓ 总共找到 {len(unique_posts)} 个不重复的帖子，正在生成回答..."
         print(f"\n{AGENT_PREFIX}{msg}")
         if self.info_callback:
             self.info_callback(msg)
-        
-        # Generate final answer with streaming, reusing the existing conversation context.
-        # The messages list already contains all tool results (treehole posts), so we simply
-        # append a final user turn asking for the answer — no need to re-send the posts.
+
         print_separator("-")
         print("\n【最终回答】\n")
-        
+
         messages.append({
             "role": "user",
-            "content": "好的，你已经完成了所有搜索。请现在基于你已经检索到的所有树洞内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造信息；如果信息不足请诚实说明。"
+            "content": "好的，你已经完成了所有搜索。请现在基于你已经检索到的所有树洞内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造信息；如果信息不足请诚实说明。",
         })
-        
         response = self._call_deepseek_with_tools(messages, tools=[], stream=True)
         final_answer = response.get("content") or ""
-        
+
         print("\n")
         print_separator("-")
-        
+
         return {
             "answer": final_answer,
             "search_count": search_count,
@@ -684,112 +755,128 @@ class TreeholeRAGAgent:
             "sources": [{"pid": p.get("pid"), "text": p.get("text", "")[:100] + "..."} for p in unique_posts[:20]],
             "num_sources": len(unique_posts),
         }
-    
-    def _call_deepseek_with_tools(self, messages: List[Dict], tools: List[Dict], stream: bool = False) -> Dict:
-        """
-        Call DeepSeek API with function calling support.
-        
-        Args:
-            messages: Conversation messages.
-            tools: Available tools/functions.
-            stream: Whether to stream the response. When True and no tool_calls,
-                    streams content via self.stream_callback and returns accumulated text.
-            
-        Returns:
-            Response dict with content or tool_calls.
-        """
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        
+
+    # ------------------------------------------------------------------ #
+    #           Mode 2 Multi-turn: persistent conversation                #
+    # ------------------------------------------------------------------ #
+
+    def save_conversation(self):
+        """Save conversation history to disk."""
         data = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": TEMPERATURE,
-            "max_tokens": MAX_RESPONSE_TOKENS,
-            "stream": stream,
+            "history": self._conversation_history,
+            "search_count": self._conversation_search_count,
         }
-        
-        if tools:
-            data["tools"] = tools
-            data["tool_choice"] = "auto"
-        
+        os.makedirs(os.path.dirname(CONVERSATION_FILE), exist_ok=True)
+        with open(CONVERSATION_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"{AGENT_PREFIX}✓ 对话已保存到 {CONVERSATION_FILE}")
+
+    def load_conversation(self) -> bool:
+        """Load conversation history from disk. Returns True if loaded."""
+        if not os.path.exists(CONVERSATION_FILE):
+            return False
         try:
-            if stream:
-                response = requests.post(
-                    f"{self.api_base}/chat/completions",
-                    headers=headers,
-                    json=data,
-                    timeout=120,
-                    stream=True,
-                )
-                response.raise_for_status()
-                
-                full_content = ""
-                tool_calls_raw = None
-                
-                for line in response.iter_lines():
-                    if line:
-                        line_str = line.decode('utf-8')
-                        if line_str.startswith('data: '):
-                            data_str = line_str[6:]
-                            if data_str.strip() == '[DONE]':
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-                                if 'choices' in chunk and len(chunk['choices']) > 0:
-                                    delta = chunk['choices'][0].get('delta', {})
-                                    # 流式 tool_calls 在第一个 chunk 里
-                                    if delta.get('tool_calls') and tool_calls_raw is None:
-                                        tool_calls_raw = delta['tool_calls']
-                                    content = delta.get('content', '')
-                                    if content:
-                                        if self.stream_callback:
-                                            self.stream_callback(content)
-                                        else:
-                                            print(content, end='', flush=True)
-                                        full_content += content
-                            except json.JSONDecodeError:
-                                continue
-                
-                if tool_calls_raw:
-                    return {"content": None, "tool_calls": tool_calls_raw}
-                return {"content": full_content, "tool_calls": None}
-            else:
-                response = requests.post(
-                    f"{self.api_base}/chat/completions",
-                    headers=headers,
-                    json=data,
-                    timeout=120,
-                )
-                response.raise_for_status()
-                result = response.json()
-                
-                choice = result["choices"][0]
-                message = choice["message"]
-                
-                return {
-                    "content": message.get("content"),
-                    "tool_calls": message.get("tool_calls"),
-                }
-            
-        except requests.exceptions.HTTPError as e:
-            error_detail = ""
-            try:
-                error_detail = e.response.json().get("error", {}).get("message", e.response.text)
-            except Exception:
-                error_detail = str(e)
-            print(f"{AGENT_PREFIX}错误: DeepSeek API 调用失败 - {error_detail}")
-            return {"content": None, "tool_calls": None}
+            with open(CONVERSATION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._conversation_history = data.get("history", [])
+            self._conversation_search_count = data.get("search_count", 0)
+            turns = sum(1 for m in self._conversation_history if m["role"] == "user") // 2
+            print(f"{AGENT_PREFIX}✓ 已恢复上次对话（{turns} 轮，{self._conversation_search_count} 次搜索）")
+            return True
         except Exception as e:
-            print(f"{AGENT_PREFIX}错误: DeepSeek API 调用失败 - {e}")
-            return {"content": None, "tool_calls": None}
+            print(f"{AGENT_PREFIX}加载对话记录失败: {e}")
+            return False
+
+    def reset_conversation(self):
+        """Reset conversation state. Archive old record if exists."""
+        self._conversation_history.clear()
+        self._conversation_searched_posts.clear()
+        self._conversation_search_count = 0
+        if os.path.exists(CONVERSATION_FILE):
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_path = CONVERSATION_FILE.replace(".json", f"_{ts}.json")
+            os.rename(CONVERSATION_FILE, archive_path)
+            print(f"{AGENT_PREFIX}✓ 旧对话已归档: {archive_path}")
+        print(f"{AGENT_PREFIX}✓ 对话已重置")
+
+    def mode_auto_search_multi_turn(self, user_question: str) -> Dict[str, Any]:
+        """Mode 2 Multi-turn: auto search with persistent conversation history.
+
+        Each call appends the new user question to the existing conversation,
+        allowing follow-up questions that leverage previously retrieved context.
+        Call ``reset_conversation()`` to start fresh.
+        """
+        # Lazy-init system message on first turn
+        if not self._conversation_history:
+            print_header("模式 2: 智能自动检索（多轮对话）")
+            self._conversation_history.append({
+                "role": "system",
+                "content": self._AUTO_SEARCH_SYSTEM_PROMPT.format(half_iter=MAX_SEARCH_ITERATIONS / 2),
+            })
+        else:
+            print_separator("-")
+            print(f"\n{AGENT_PREFIX}继续多轮对话（已有 {self._conversation_search_count} 次搜索记录）\n")
+
+        # Append user message
+        self._conversation_history.append({"role": "user", "content": user_question})
+
+        search_history_this_turn: List[Dict] = []
+
+        msg = "✓ LLM 分析中..."
+        print(f"{AGENT_PREFIX}{msg}")
+        if self.info_callback:
+            self.info_callback(msg)
+
+        # Run search loop (may or may not trigger searches depending on LLM)
+        self._conversation_search_count = self._execute_search_loop(
+            self._conversation_history,
+            self._conversation_searched_posts,
+            search_history_this_turn,
+            self._conversation_search_count,
+            self._conversation_search_count + MAX_SEARCH_ITERATIONS,  # allow N more searches per turn
+        )
+
+        unique_posts = list({p["pid"]: p for p in self._conversation_searched_posts}.values())
+
+        if search_history_this_turn:
+            msg = f"✓ 本轮搜索 {len(search_history_this_turn)} 次，累计 {len(unique_posts)} 个不重复帖子"
+            print(f"\n{AGENT_PREFIX}{msg}")
+            if self.info_callback:
+                self.info_callback(msg)
+
+        # Ask LLM for final answer
+        print_separator("-")
+        print("\n【回答】\n")
+
+        self._conversation_history.append({
+            "role": "user",
+            "content": "请基于你已经检索到的所有树洞内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造信息；如果信息不足请诚实说明。",
+        })
+
+        response = self._call_deepseek_with_tools(self._conversation_history, tools=[], stream=True)
+        final_answer = response.get("content") or ""
+
+        # Save assistant reply to history for next turn
+        self._conversation_history.append({"role": "assistant", "content": final_answer})
+
+        print("\n")
+        print_separator("-")
+
+        return {
+            "answer": final_answer,
+            "search_count": self._conversation_search_count,
+            "search_history": search_history_this_turn,
+            "sources": [{"pid": p.get("pid"), "text": p.get("text", "")[:100] + "..."} for p in unique_posts[:20]],
+            "num_sources": len(unique_posts),
+            "conversation_turns": sum(1 for m in self._conversation_history if m["role"] == "user") // 2,
+        }
+
+    # ------------------------------------------------------------------ #
+    #                  Mode 3: Course review analysis                     #
+    # ------------------------------------------------------------------ #
 
     def mode_course_review(self, course_abbr: str, teacher_initials: str) -> Dict[str, Any]:
-        """
-        Mode 3: Single-teacher course review analysis.
-        """
+        """Mode 3: Single-teacher course review analysis."""
         parsed_teachers = self.parse_teacher_input(teacher_initials)
         if len(parsed_teachers) > 1:
             return self.mode_course_review_compare(course_abbr, parsed_teachers)
@@ -799,16 +886,13 @@ class TreeholeRAGAgent:
 
         print_header("模式 3: 课程测评分析")
 
-        # Step 1: Construct search keyword
         search_keyword = self._build_course_search_keyword(course_abbr, teacher)
         msg = f"搜索关键词: {search_keyword}"
         print(f"{AGENT_PREFIX}{msg}")
         if self.info_callback:
             self.info_callback(msg)
 
-        # Step 2: Search Treehole
         posts = self.search_treehole(search_keyword, max_results=MAX_SEARCH_RESULTS)
-
         if not posts:
             return {
                 "answer": f"抱歉，没有找到关于「{course_abbr} {teacher_display}」课程的测评内容。",
@@ -822,7 +906,6 @@ class TreeholeRAGAgent:
         if self.info_callback:
             self.info_callback(msg)
 
-        # Step 3: Extract reviews
         msg = "✓ 正在从评论中提取课程测评..."
         print(f"{AGENT_PREFIX}{msg}")
         if self.info_callback:
@@ -842,28 +925,22 @@ class TreeholeRAGAgent:
         if self.info_callback:
             self.info_callback(msg)
 
-        # Step 4: Display retrieved reviews
         print_separator("-")
         print(f"\n【找到 {len(course_reviews)} 条课程测评】\n")
-
         for i, review in enumerate(course_reviews[:10], 1):
             lz_mark = "[洞主]" if review.get("is_lz") else ""
             text_preview = review["text"][:80].replace("\n", " ")
             print(f"{i}. {lz_mark} {review['type']} #{review['pid']}: {text_preview}...")
-
         if len(course_reviews) > 10:
             print(f"... 还有 {len(course_reviews) - 10} 条评论")
-
         print_separator("-")
 
-        # Step 5: Format reviews for LLM
         reviews_text = ""
         for i, review in enumerate(course_reviews, 1):
             lz_mark = "[洞主]" if review.get("is_lz") else ""
             reviews_text += f"\n--- 评论 {i} {lz_mark} (帖子#{review['pid']}) ---\n"
             reviews_text += review["text"] + "\n"
 
-        # Step 6: Construct analysis prompt
         system_message = f"""你是一个专业的课程评价分析助手。你的任务是仔细分析北大树洞中关于「{course_abbr}」课程（{teacher_display}）的所有测评，综合多方观点，给出全面的分析。
 
 分析要求：
@@ -889,7 +966,6 @@ class TreeholeRAGAgent:
 
 请仔细分析以上所有测评，从课程难度、教学质量、课程内容、考核方式、选课建议等多个维度，给出全面、客观的分析和建议。"""
 
-        # Step 7: Call LLM with streaming
         print(f"\n【课程「{course_abbr}」({teacher_display}) 综合分析】\n")
         answer = self.call_deepseek(user_message, system_message, stream=True)
 
@@ -902,9 +978,7 @@ class TreeholeRAGAgent:
         }
 
     def mode_course_review_compare(self, course_abbr: str, teachers: List[str]) -> Dict[str, Any]:
-        """
-        Mode 3B: Compare reviews of the same course across multiple teachers.
-        """
+        """Mode 3B: Compare reviews of the same course across multiple teachers."""
         teacher_list: List[str] = []
         seen = set()
         for teacher in teachers:
@@ -930,14 +1004,12 @@ class TreeholeRAGAgent:
 
             posts = self.search_treehole(search_keyword, max_results=MAX_SEARCH_RESULTS)
             if not posts:
-                teacher_results.append(
-                    {
-                        "teacher": teacher,
-                        "search_keyword": search_keyword,
-                        "posts": [],
-                        "reviews": [],
-                    }
-                )
+                teacher_results.append({
+                    "teacher": teacher,
+                    "search_keyword": search_keyword,
+                    "posts": [],
+                    "reviews": [],
+                })
                 print(f"{AGENT_PREFIX}[{teacher}] 未找到帖子")
                 continue
 
@@ -945,14 +1017,12 @@ class TreeholeRAGAgent:
             reviews = self._extract_course_reviews_from_posts(posts, course_abbr, teacher)
             print(f"{AGENT_PREFIX}[{teacher}] 提取到 {len(reviews)} 条测评")
 
-            teacher_results.append(
-                {
-                    "teacher": teacher,
-                    "search_keyword": search_keyword,
-                    "posts": posts,
-                    "reviews": reviews,
-                }
-            )
+            teacher_results.append({
+                "teacher": teacher,
+                "search_keyword": search_keyword,
+                "posts": posts,
+                "reviews": reviews,
+            })
 
         valid_results = [item for item in teacher_results if item["reviews"]]
         if not valid_results:
@@ -973,7 +1043,6 @@ class TreeholeRAGAgent:
             print(f"- {item['teacher']}: 帖子 {len(item['posts'])} 个，测评 {len(item['reviews'])} 条")
         print_separator("-")
 
-        # Build grouped review context (truncate per teacher to control context size)
         max_reviews_per_teacher = 30
         max_review_chars = 600
         grouped_reviews_text = ""
@@ -1042,13 +1111,11 @@ class TreeholeRAGAgent:
         for item in valid_results:
             teacher = item["teacher"]
             for review in item["reviews"][:5]:
-                sources.append(
-                    {
-                        "teacher": teacher,
-                        "pid": review["pid"],
-                        "text": review["text"][:100] + "...",
-                    }
-                )
+                sources.append({
+                    "teacher": teacher,
+                    "pid": review["pid"],
+                    "text": review["text"][:100] + "...",
+                })
 
         return {
             "answer": answer,
@@ -1060,57 +1127,80 @@ class TreeholeRAGAgent:
             "comparison_mode": True,
         }
 
+    # ------------------------------------------------------------------ #
+    #                      Interactive CLI                                #
+    # ------------------------------------------------------------------ #
+
     def interactive_mode(self):
-        """
-        Interactive mode for testing the agent.
-        """
+        """Interactive mode for testing the agent."""
         print_header("PKU Treehole RAG Agent - Interactive Mode")
-        
+
         while True:
             print("\n选择模式:")
             print("  1 - 手动输入关键词检索")
-            print("  2 - LLM自动生成关键词检索")
+            print("  2 - LLM自动检索（多轮对话）")
             print("  3 - LLM自动课程测评分析")
             print("  q - 退出\n")
             mode = input("请选择模式 (1/2/3/q): ").strip()
-            
+
             if mode == 'q':
                 print(f"{AGENT_PREFIX}正在退出...")
                 break
-            
+
             if mode not in ['1', '2', '3']:
                 print(f"{AGENT_PREFIX}无效选择，请重试")
                 continue
-            
+
             if mode == '3':
-                # Course review mode
                 course_abbr = input("\n请输入课程缩写（如：计网、操统）: ").strip()
                 if not course_abbr:
                     print(f"{AGENT_PREFIX}课程缩写不能为空")
                     continue
-                
                 teacher_initials = input("请输入老师姓名首字母（支持多个，用逗号/空格分隔，如：zhx,yyx）: ").strip()
                 if not teacher_initials:
                     print(f"{AGENT_PREFIX}老师姓名首字母不能为空")
                     continue
-                
                 result = self.mode_course_review(course_abbr, teacher_initials)
-            else:
-                # Original modes
+
+            elif mode == '1':
                 user_question = input("\n请输入你的问题: ").strip()
-                
                 if not user_question:
                     print(f"{AGENT_PREFIX}问题不能为空")
                     continue
-                
-                if mode == '1':
-                    keyword = input("请输入搜索关键词: ").strip()
-                    if not keyword:
-                        print(f"{AGENT_PREFIX}关键词不能为空")
-                        continue
-                    result = self.mode_manual_search(keyword, user_question)
+                keyword = input("请输入搜索关键词: ").strip()
+                if not keyword:
+                    print(f"{AGENT_PREFIX}关键词不能为空")
+                    continue
+                result = self.mode_manual_search(keyword, user_question)
+
+            elif mode == '2':
+                # ===== 多轮对话模式 =====
+                # 尝试恢复上次对话
+                if self.load_conversation():
+                    resume = input("检测到上次对话记录，是否继续？(Y/n): ").strip().lower()
+                    if resume not in ('y', ''):
+                        self.reset_conversation()
                 else:
-                    result = self.mode_auto_search(user_question)
+                    self.reset_conversation()
+
+                print(f"\n{AGENT_PREFIX}多轮对话模式（/reset 重置, /save 存档, /quit 退出）\n")
+
+                while True:
+                    user_question = input("\n你: ").strip()
+                    if not user_question:
+                        continue
+                    if user_question == "/quit":
+                        self.save_conversation()  # 退出时自动存档
+                        print(f"{AGENT_PREFIX}退出多轮对话")
+                        break
+                    if user_question == "/reset":
+                        self.reset_conversation()
+                        continue
+                    if user_question == "/save":
+                        self.save_conversation()
+                        continue
+
+                    result = self.mode_auto_search_multi_turn(user_question)
 
 
 def main():
