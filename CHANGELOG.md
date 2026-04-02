@@ -1,5 +1,70 @@
 # 更新日志 (CHANGELOG)
 
+## [v2.2.0] - 2026-03-22
+
+### ✨ Agent 工作流升级（两阶段检索 + memory + PID工具）
+
+#### 工具体系增强
+- 新增 `get_post_by_pid` 工具：已知 PID 时可直接抓单帖，减少冗余搜索上下文
+- 新增 `get_comments_by_pid` 工具：已确定高价值帖子后，按 PID 精确补拉评论
+- `mode_auto_search` / 多轮模式均支持 `search_treehole + get_post_by_pid + get_comments_by_pid`
+
+#### 两阶段检索策略
+- 阶段A（宽泛探索）：10-20 次，用于识别黑话/别称/简称
+- 阶段B（高质量聚焦）：5-10 次，优先高 reply / 高 star 帖子
+- 阶段A首次搜索结果会展示“每帖最多 3 条评论预览”（来自 search 接口 `comment_list`），仅展示一次
+
+#### 记忆机制增强
+- 新增 `agent.md` 持久经验库（中文提示词）
+- 新增单会话临时 memory：`data/task_memory/memory_YYYYMMDD_HHMMSS.md`
+- 每轮工具调用前自动注入最新 memory 快照，保证会话内持续上下文
+
+#### 配置项新增
+- `BROAD_SEARCH_MIN` / `BROAD_SEARCH_MAX`
+- `FOCUSED_SEARCH_MIN` / `FOCUSED_SEARCH_MAX`
+
+#### 文档同步
+- README 已同步两阶段策略、PID工具、memory 文件命名与阶段A评论预览行为
+
+## [v2.1.0] - 2026-03-22
+
+### ✨ 检索与上下文打包增强
+
+#### 检索链路改进
+- 搜索支持分页拉取，直到达到 `MAX_SEARCH_RESULTS` 或无更多结果
+- 移除模式 1/2 中多处硬编码上限（如固定 30 帖、固定 10 评论）
+- 搜索缓存键增加配置维度，避免不同配置复用同一缓存
+
+#### 评论加载改进
+- 模式 1/2 在发送给 LLM 前支持按配置补拉评论
+- `MAX_COMMENTS_PER_POST` 语义统一：
+  - `0` 不加载评论
+  - 正整数按上限加载
+  - `-1` 尝试全量加载
+- 课程测评模式的全量评论获取逻辑复用同一底层实现
+
+#### 元数据标准化与上下文增强
+- 帖子新增标准化字段：`post_time`、`reply_count`、`star_count`、`has_image`
+- 评论新增标准化字段：`reply_time`
+- 发给 LLM 的文本上下文中新增元数据区块，显式包含：
+  - 帖子编号
+  - reply 数
+  - star 数
+  - 帖子发表时间
+  - 评论回复时间
+  - 是否有图片
+
+#### 配置项新增
+- `SEARCH_PAGE_LIMIT`
+- `SEARCH_COMMENT_LIMIT`
+- `INCLUDE_IMAGE_POSTS`
+- `MAX_CONTEXT_TOKENS_MANUAL`
+- `MAX_CONTEXT_TOKENS_AUTO`
+
+#### 文档同步
+- README 已同步以上配置项与行为说明
+- README 的限流示例改为 `SEARCH_DELAY_MIN/MAX` 与 `COMMENT_DELAY_MIN/MAX`
+
 
 **改动总结1st**
 1. **模式 2 多轮对话**

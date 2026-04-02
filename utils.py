@@ -26,7 +26,9 @@ def format_post_to_text(post: Dict[str, Any], include_comments: bool = True, max
     # Post header
     pid = post.get("pid", "unknown")
     timestamp = post.get("timestamp", 0)
-    time_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S") if timestamp else "unknown"
+    time_str = post.get("post_time") or (
+        datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S") if timestamp else "unknown"
+    )
     
     lines.append(f"=== 帖子 #{pid} ===")
     lines.append(f"时间: {time_str}")
@@ -36,9 +38,18 @@ def format_post_to_text(post: Dict[str, Any], include_comments: bool = True, max
     lines.append(f"\n内容:\n{text}")
     
     # Post metadata
-    likenum = post.get("likenum", 0)
-    reply_count = post.get("reply", 0)
-    lines.append(f"\n点赞: {likenum} | 回复: {reply_count}")
+    likenum = post.get("star_count", post.get("likenum", 0))
+    reply_count = post.get("reply_count", post.get("reply", 0))
+    has_image = post.get("has_image")
+    if has_image is None:
+        has_image = post.get("type") == "image" or bool(post.get("media_ids"))
+
+    lines.append("\n元数据:")
+    lines.append(f"- 帖子编号: {pid}")
+    lines.append(f"- 发布时间: {time_str}")
+    lines.append(f"- reply数: {reply_count}")
+    lines.append(f"- star数: {likenum}")
+    lines.append(f"- 是否有图片: {'是' if has_image else '否'}")
     
     # Tags if available
     if "tag" in post:
@@ -55,7 +66,11 @@ def format_post_to_text(post: Dict[str, Any], include_comments: bool = True, max
             for i, comment in enumerate(comments[:comment_limit], 1):
                 comment_text = comment.get("text", "")
                 comment_name = comment.get("name_tag", "Anonymous")
-                lines.append(f"{i}. [{comment_name}] {comment_text}")
+                comment_ts = comment.get("timestamp", 0)
+                reply_time = comment.get("reply_time") or (
+                    datetime.fromtimestamp(comment_ts).strftime("%Y-%m-%d %H:%M:%S") if comment_ts else "unknown"
+                )
+                lines.append(f"{i}. [{comment_name}] (回复时间: {reply_time}) {comment_text}")
     
     lines.append("=" * 50)
     lines.append("")
@@ -218,6 +233,9 @@ def smart_truncate_posts(posts: List[Dict[str, Any]], max_tokens: int = 4000, ma
     Returns:
         list: Truncated list of posts.
     """
+    if max_tokens <= 0:
+        return list(posts)
+
     selected_posts = []
     total_tokens = 0
     

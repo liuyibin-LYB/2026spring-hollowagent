@@ -85,7 +85,7 @@ class EmailBot:
     
     def parse_prompt(self, subject: str, body: str) -> dict:
         """
-        解析邮件主题和正文，识别查询模式
+        解析邮件主题和正文（仅模式2）
         
         参数:
             subject: 邮件主题（用于判断模式）
@@ -93,55 +93,13 @@ class EmailBot:
         
         返回:
             {
-                "mode": 1/2/3,
-                "keyword": str (模式1),
-                "question": str (模式1/2),
-                "course": str (模式3),
-                "teacher": str (模式3，支持多个老师，用逗号/空格分隔)
+                "mode": 2,
+                "question": str
             }
         """
         body = body.strip()
-        lines = [line.strip() for line in body.split('\n') if line.strip()]
-        
-        # 从主题判断模式
-        subject_lower = subject.lower()
-        
-        # 模式 1: 手动检索
-        # 主题: "树洞 手动检索" 或 "树洞 手动" 或包含 "手动"
-        if '手动' in subject_lower:
-            if len(lines) >= 2:
-                return {
-                    "mode": 1,
-                    "keyword": lines[0],
-                    "question": '\n'.join(lines[1:]),
-                }
-            elif len(lines) == 1:
-                # 只有一行，当作关键词，问题为空
-                return {
-                    "mode": 1,
-                    "keyword": lines[0],
-                    "question": "请介绍一下这个话题",
-                }
-        
-        # 模式 3: 课程测评
-        # 主题: "树洞 课程测评" 或 "树洞 测评" 或包含 "测评" 或 "课程"
-        if '测评' in subject_lower or '课程' in subject_lower:
-            if len(lines) >= 2:
-                return {
-                    "mode": 3,
-                    "course": lines[0],
-                    "teacher": lines[1],
-                }
-            elif len(lines) == 1:
-                # 只有课程名，老师留空
-                return {
-                    "mode": 3,
-                    "course": lines[0],
-                    "teacher": "",
-                }
-        
-        # 模式 2: 自动检索（默认）
-        # 主题: "树洞 自动检索" 或 "树洞 自动" 或其他
+
+        # 仅支持模式2：自动检索
         return {
             "mode": 2,
             "question": body,
@@ -169,24 +127,7 @@ class EmailBot:
             response = f"# 树洞查询结果\n\n"
             response += f"**查询时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             
-            if mode == 1:
-                # 手动关键词模式
-                keyword = parsed["keyword"]
-                question = parsed["question"]
-                response += f"**模式**: 手动关键词检索\n"
-                response += f"**关键词**: `{keyword}`\n"
-                response += f"**问题**: {question}\n\n"
-                response += "---\n\n"
-                
-                print(f"{PREFIX} 关键词: {keyword}, 问题: {question}")
-                result = self.agent.mode_manual_search(keyword, question)
-                response += result["answer"]
-                
-                # 添加来源信息
-                if result.get("sources"):
-                    response += f"\n\n---\n\n**参考来源**: {result['num_sources']} 个帖子\n"
-                
-            elif mode == 2:
+            if mode == 2:
                 # 智能自动检索模式
                 question = parsed["question"]
                 response += f"**模式**: 智能自动检索\n"
@@ -211,34 +152,6 @@ class EmailBot:
                 # 添加来源信息
                 if result.get("sources"):
                     response += f"\n\n---\n\n**参考来源**: {result['num_sources']} 个帖子\n"
-                
-            elif mode == 3:
-                # 课程测评分析模式（支持多老师横向对比）
-                course = parsed["course"]
-                teacher = parsed["teacher"]
-                teacher_list = self.agent.parse_teacher_input(teacher)
-
-                if len(teacher_list) > 1:
-                    response += f"**模式**: 课程测评横向对比\n"
-                    response += f"**课程**: {course}\n"
-                    response += f"**老师列表**: {', '.join(teacher_list)}\n\n"
-                    response += "---\n\n"
-
-                    print(f"{PREFIX} 课程: {course}, 老师列表: {teacher_list}")
-                    result = self.agent.mode_course_review_compare(course, teacher_list)
-                else:
-                    response += f"**模式**: 课程测评分析\n"
-                    response += f"**课程**: {course}\n"
-                    response += f"**老师**: {teacher}\n\n"
-                    response += "---\n\n"
-
-                    print(f"{PREFIX} 课程: {course}, 老师: {teacher}")
-                    result = self.agent.mode_course_review(course, teacher)
-                response += result["answer"]
-                
-                # 添加来源信息
-                if result.get("sources"):
-                    response += f"\n\n---\n\n**参考来源**: {result['num_sources']} 条测评\n"
             
             return response
             
@@ -249,13 +162,8 @@ class EmailBot:
             error_msg += traceback.format_exc()
             error_msg += "```\n\n"
             error_msg += "## 使用说明\n\n"
-            error_msg += "请确保邮件格式正确：\n\n"
-            error_msg += "**模式1 - 手动检索**:\n"
-            error_msg += "```\n主题: 树洞 手动检索\n正文:\n计网\n这门课怎么样？\n```\n\n"
-            error_msg += "**模式2 - 自动检索**:\n"
+            error_msg += "当前仅支持模式2（自动检索），请按如下格式发送：\n\n"
             error_msg += "```\n主题: 树洞 自动检索\n正文:\n我想了解计算机图形学这门课\n```\n\n"
-            error_msg += "**模式3 - 课程测评**:\n"
-            error_msg += "```\n主题: 树洞 课程测评\n正文:\n计网\nhq\n```\n"
             
             print(f"{PREFIX} 错误: {e}")
             traceback.print_exc()
@@ -399,13 +307,11 @@ class EmailBot:
                     # 生成不含"树洞"的回信标题，避免触发回环
                     parsed = self.parse_prompt(subject, body)
                     mode = parsed["mode"]
-                    if mode == 1:
-                        reply_subject = f"[检索结果] {parsed.get('keyword', '')[:20]}"
-                    elif mode == 2:
+                    if mode == 2:
                         q = parsed.get('question', '').replace('\n', ' ')[:25]
                         reply_subject = f"[检索结果] {q}"
                     else:
-                        reply_subject = f"[测评结果] {parsed.get('course', '')} · {parsed.get('teacher', '')}"
+                        reply_subject = "[检索结果] 树洞查询"
                     self.send_reply(from_email, reply_subject, reply_body)
                     
                     print(f"{PREFIX} 查询处理完成")
