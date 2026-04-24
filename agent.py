@@ -47,9 +47,15 @@ except ImportError:
 
 USERNAME = _cfg.USERNAME
 PASSWORD = _cfg.PASSWORD
-DEEPSEEK_API_KEY = _cfg.DEEPSEEK_API_KEY
-DEEPSEEK_API_BASE = _cfg.DEEPSEEK_API_BASE
-DEEPSEEK_MODEL = _cfg.DEEPSEEK_MODEL
+LLM_API_KEY = _cfg.LLM_API_KEY
+LLM_API_BASE = _cfg.LLM_API_BASE
+LLM_MODEL = _cfg.LLM_MODEL
+LLM_CHAT_COMPLETIONS_PATH = getattr(_cfg, "LLM_CHAT_COMPLETIONS_PATH", "/chat/completions")
+LLM_EXTRA_HEADERS = getattr(_cfg, "LLM_EXTRA_HEADERS", {})
+LLM_EXTRA_BODY = getattr(_cfg, "LLM_EXTRA_BODY", {})
+LLM_ENABLE_PARALLEL_TOOL_CALLS = getattr(_cfg, "LLM_ENABLE_PARALLEL_TOOL_CALLS", True)
+LLM_REASONING_EFFORT = getattr(_cfg, "LLM_REASONING_EFFORT", None)
+LLM_THINKING_TYPE = getattr(_cfg, "LLM_THINKING_TYPE", "auto")
 
 MAX_SEARCH_RESULTS = _cfg.MAX_SEARCH_RESULTS
 MAX_CONTEXT_POSTS = _cfg.MAX_CONTEXT_POSTS
@@ -72,8 +78,8 @@ INCLUDE_IMAGE_POSTS = getattr(_cfg, "INCLUDE_IMAGE_POSTS", True)
 MAX_COMMENT_FETCH_POSTS = getattr(_cfg, "MAX_COMMENT_FETCH_POSTS", 6)
 COMMENT_FETCH_MAX_PARALLEL = getattr(_cfg, "COMMENT_FETCH_MAX_PARALLEL", 10)
 COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "COMMENT_FETCH_MAX_REQUESTS_PER_SECOND", 20.0)
-DEEPSEEK_RETRY_MAX_ATTEMPTS = getattr(_cfg, "DEEPSEEK_RETRY_MAX_ATTEMPTS", 5)
-DEEPSEEK_RETRY_SLEEP_SECONDS = getattr(_cfg, "DEEPSEEK_RETRY_SLEEP_SECONDS", 5)
+LLM_RETRY_MAX_ATTEMPTS = getattr(_cfg, "LLM_RETRY_MAX_ATTEMPTS", 5)
+LLM_RETRY_SLEEP_SECONDS = getattr(_cfg, "LLM_RETRY_SLEEP_SECONDS", 5)
 
 # Two-stage auto-search planning
 BROAD_SEARCH_MIN = getattr(_cfg, "BROAD_SEARCH_MIN", 10)
@@ -120,7 +126,7 @@ class _TokenBucket:
 
 class TreeholeRAGAgent:
     """
-    RAG Agent for PKU Treehole with DeepSeek integration.
+    RAG Agent for PKU Treehole with an OpenAI-compatible LLM backend.
     Supports staged automatic keyword-based retrieval.
     """
 
@@ -234,7 +240,7 @@ class TreeholeRAGAgent:
     )
 
     def __init__(self, interactive=True, cookies_file=None):
-        """Initialize the agent with Treehole client and DeepSeek API.
+        """Initialize the agent with Treehole client and an OpenAI-compatible LLM API.
 
         Args:
             interactive (bool): Whether to allow interactive prompts for login verification.
@@ -242,9 +248,15 @@ class TreeholeRAGAgent:
             cookies_file (str): Path to user-specific cookies file. If None, uses default.
         """
         self.client = TreeholeClient(cookies_file=cookies_file)
-        self.api_key = DEEPSEEK_API_KEY
-        self.api_base = DEEPSEEK_API_BASE
-        self.model = DEEPSEEK_MODEL
+        self.api_key = LLM_API_KEY
+        self.api_base = LLM_API_BASE
+        self.model = LLM_MODEL
+        self.chat_completions_path = LLM_CHAT_COMPLETIONS_PATH
+        self.extra_headers = dict(LLM_EXTRA_HEADERS) if isinstance(LLM_EXTRA_HEADERS, dict) else {}
+        self.extra_body = dict(LLM_EXTRA_BODY) if isinstance(LLM_EXTRA_BODY, dict) else {}
+        self.enable_parallel_tool_calls = bool(LLM_ENABLE_PARALLEL_TOOL_CALLS)
+        self.reasoning_effort = LLM_REASONING_EFFORT
+        self.thinking_type = LLM_THINKING_TYPE
         self._all_comments_cache: Dict[int, List[Dict[str, Any]]] = {}
         self.stream_callback = None  # Optional callback for streaming output
         self.info_callback = None    # Callback for progress/info messages
@@ -720,7 +732,7 @@ class TreeholeRAGAgent:
             "请只返回 JSON，不要输出额外文字。"
         )
 
-        raw = self.call_deepseek(
+        raw = self.call_llm(
             user_message=user_message,
             system_message=system_message,
             temperature=0.0,
@@ -982,11 +994,98 @@ class TreeholeRAGAgent:
             return []
 
     # ------------------------------------------------------------------ #
-    #                        DeepSeek API calls                           #
+    #                  OpenAI-compatible LLM API calls                    #
     # ------------------------------------------------------------------ #
 
-    def _extract_deepseek_error_detail(self, error: Exception) -> str:
-        """Extract readable error details from DeepSeek HTTP errors."""
+    def _get_chat_completions_url(self) -> str:
+        """Build the chat completions endpoint URL for the configured backend."""
+        base = str(self.api_base or "").rstrip("/")
+        path = str(self.chat_completions_path or "/chat/completions").strip()
+        if not base:
+            raise ValueError("LLM_API_BASE is empty")
+        if base.endswith("/chat/completions"):
+            return base
+        if not path:
+            path = "/chat/completions"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        return f"{base}{path}"
+
+    def _build_llm_headers(self) -> Dict[str, str]:
+        """Build request headers for the configured backend."""
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        for key, value in self.extra_headers.items():
+            headers[str(key)] = str(value)
+        return headers
+
+    def _is_deepseek_v4_model(self) -> bool:
+        """Return True when the configured model looks like a DeepSeek V4 chat model."""
+        model_name = str(self.model or "").lower()
+        return "deepseek-v4" in model_name
+
+    def _normalize_reasoning_effort(self) -> Optional[str]:
+        """Normalize configured reasoning effort to a lowercase string."""
+        if not isinstance(self.reasoning_effort, str):
+            return None
+        normalized = self.reasoning_effort.strip().lower()
+        return normalized or None
+
+    def _build_llm_payload(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+        stream: bool,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Build a chat-completions payload with optional provider-specific extras."""
+        data: Dict[str, Any] = dict(self.extra_body)
+        data.update({
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": MAX_RESPONSE_TOKENS,
+            "stream": stream,
+        })
+        if tools:
+            data["tools"] = tools
+            data["tool_choice"] = "auto"
+
+        reasoning_effort = self._normalize_reasoning_effort()
+        thinking_type = None
+        if isinstance(self.thinking_type, str):
+            candidate = self.thinking_type.strip().lower()
+            if candidate in {"enabled", "disabled"}:
+                thinking_type = candidate
+
+        if self._is_deepseek_v4_model():
+            # DeepSeek V4 uses OpenAI-compatible reasoning_effort, but its effective
+            # values are narrowed to high/max. Keep a single config surface and map.
+            mapped_effort = None
+            if reasoning_effort not in {None, "auto"}:
+                if reasoning_effort in {"none", "off", "disabled"}:
+                    thinking_type = "disabled"
+                elif reasoning_effort in {"xhigh", "max"}:
+                    mapped_effort = "max"
+                    if thinking_type is None:
+                        thinking_type = "enabled"
+                else:
+                    mapped_effort = "high"
+                    if thinking_type is None:
+                        thinking_type = "enabled"
+
+            if thinking_type in {"enabled", "disabled"}:
+                data["thinking"] = {"type": thinking_type}
+            if mapped_effort and thinking_type != "disabled":
+                data["reasoning_effort"] = mapped_effort
+        else:
+            if reasoning_effort and reasoning_effort != "auto":
+                data["reasoning_effort"] = reasoning_effort
+        return data
+
+    def _extract_llm_error_detail(self, error: Exception) -> str:
+        """Extract readable error details from the configured LLM backend."""
         if isinstance(error, requests.exceptions.HTTPError) and getattr(error, "response", None) is not None:
             try:
                 payload = error.response.json()
@@ -1001,7 +1100,7 @@ class TreeholeRAGAgent:
                 return str(error)
         return str(error)
 
-    def _is_retryable_deepseek_error(self, error: Exception) -> bool:
+    def _is_retryable_llm_error(self, error: Exception) -> bool:
         """Return True for transient errors that should be retried."""
         if isinstance(error, requests.exceptions.Timeout):
             return True
@@ -1012,23 +1111,23 @@ class TreeholeRAGAgent:
             if status_code == 429 or (isinstance(status_code, int) and 500 <= status_code < 600):
                 return True
 
-        error_text = self._extract_deepseek_error_detail(error).lower()
+        error_text = self._extract_llm_error_detail(error).lower()
         return (
             "rate limit" in error_text
             or "too many requests" in error_text
             or "429" in error_text
         )
 
-    def _wait_before_deepseek_retry(self, attempt: int, error: Exception) -> None:
-        detail = self._extract_deepseek_error_detail(error)
+    def _wait_before_llm_retry(self, attempt: int, error: Exception) -> None:
+        detail = self._extract_llm_error_detail(error)
         print(
-            f"{AGENT_PREFIX}错误: DeepSeek API 调用失败 - {detail}"
-            f"（第{attempt}/{DEEPSEEK_RETRY_MAX_ATTEMPTS}次）"
+            f"{AGENT_PREFIX}错误: LLM API 调用失败 - {detail}"
+            f"（第{attempt}/{LLM_RETRY_MAX_ATTEMPTS}次）"
         )
-        print(f"{AGENT_PREFIX}等待 {DEEPSEEK_RETRY_SLEEP_SECONDS} 秒后重试...")
-        time.sleep(DEEPSEEK_RETRY_SLEEP_SECONDS)
+        print(f"{AGENT_PREFIX}等待 {LLM_RETRY_SLEEP_SECONDS} 秒后重试...")
+        time.sleep(LLM_RETRY_SLEEP_SECONDS)
 
-    def call_deepseek(
+    def call_llm(
         self,
         user_message: str,
         system_message: Optional[str] = None,
@@ -1036,29 +1135,21 @@ class TreeholeRAGAgent:
         stream: bool = True,
         callback: Optional[callable] = None
     ) -> str:
-        """Call DeepSeek API for chat completion."""
+        """Call the configured OpenAI-compatible LLM API for chat completion."""
         messages = []
         if system_message:
             messages.append({"role": "system", "content": system_message})
         messages.append({"role": "user", "content": user_message})
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        data = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": MAX_RESPONSE_TOKENS,
-            "stream": stream,
-        }
+        headers = self._build_llm_headers()
+        data = self._build_llm_payload(messages, temperature=temperature, stream=stream)
+        url = self._get_chat_completions_url()
 
-        for attempt in range(1, DEEPSEEK_RETRY_MAX_ATTEMPTS + 1):
+        for attempt in range(1, LLM_RETRY_MAX_ATTEMPTS + 1):
             try:
                 if stream:
                     response = requests.post(
-                        f"{self.api_base}/chat/completions",
+                        url,
                         headers=headers,
                         json=data,
                         timeout=120,
@@ -1094,7 +1185,7 @@ class TreeholeRAGAgent:
                     return full_content
                 else:
                     response = requests.post(
-                        f"{self.api_base}/chat/completions",
+                        url,
                         headers=headers,
                         json=data,
                         timeout=60,
@@ -1103,33 +1194,48 @@ class TreeholeRAGAgent:
                     result = response.json()
                     return result["choices"][0]["message"]["content"]
             except Exception as e:
-                if attempt < DEEPSEEK_RETRY_MAX_ATTEMPTS and self._is_retryable_deepseek_error(e):
-                    self._wait_before_deepseek_retry(attempt, e)
+                if attempt < LLM_RETRY_MAX_ATTEMPTS and self._is_retryable_llm_error(e):
+                    self._wait_before_llm_retry(attempt, e)
                     continue
 
-                detail = self._extract_deepseek_error_detail(e)
-                print(f"{AGENT_PREFIX}调用 DeepSeek API 时出错: {detail}")
-                return f"抱歉，调用 DeepSeek API 时出错: {detail}"
+                detail = self._extract_llm_error_detail(e)
+                print(f"{AGENT_PREFIX}调用 LLM API 时出错: {detail}")
+                return f"抱歉，调用 LLM API 时出错: {detail}"
 
-    def _call_deepseek_with_tools(self, messages: List[Dict], tools: List[Dict], stream: bool = False) -> Dict:
-        """Call DeepSeek API with function calling support."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        data = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": TEMPERATURE,
-            "max_tokens": MAX_RESPONSE_TOKENS,
-            "stream": stream,
-        }
-        if tools:
-            data["tools"] = tools
-            data["tool_choice"] = "auto"
-        use_parallel_tool_calls = bool(tools)
+    @staticmethod
+    def _extract_reasoning_content(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Extract reasoning content from a response payload or streaming delta."""
+        if not isinstance(payload, dict):
+            return None
+        reasoning = payload.get("reasoning_content")
+        if reasoning is None:
+            reasoning = payload.get("reasoning")
+        return reasoning
 
-        for attempt in range(1, DEEPSEEK_RETRY_MAX_ATTEMPTS + 1):
+    @staticmethod
+    def _build_assistant_message(
+        content: Optional[str] = None,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        reasoning_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build an assistant message while preserving reasoning/tool-call context."""
+        message: Dict[str, Any] = {"role": "assistant"}
+        if content is not None:
+            message["content"] = content
+        if reasoning_content is not None:
+            message["reasoning_content"] = reasoning_content
+        if tool_calls is not None:
+            message["tool_calls"] = tool_calls
+        return message
+
+    def _call_llm_with_tools(self, messages: List[Dict], tools: List[Dict], stream: bool = False) -> Dict:
+        """Call the configured OpenAI-compatible LLM API with tool support."""
+        headers = self._build_llm_headers()
+        data = self._build_llm_payload(messages, temperature=TEMPERATURE, stream=stream, tools=tools)
+        url = self._get_chat_completions_url()
+        use_parallel_tool_calls = bool(tools) and self.enable_parallel_tool_calls
+
+        for attempt in range(1, LLM_RETRY_MAX_ATTEMPTS + 1):
             try:
                 req_data = dict(data)
                 if use_parallel_tool_calls:
@@ -1138,7 +1244,7 @@ class TreeholeRAGAgent:
 
                 if stream:
                     response = requests.post(
-                        f"{self.api_base}/chat/completions",
+                        url,
                         headers=headers,
                         json=req_data,
                         timeout=120,
@@ -1147,6 +1253,7 @@ class TreeholeRAGAgent:
                     response.raise_for_status()
 
                     full_content = ""
+                    full_reasoning_content = ""
                     tool_calls_raw = None
 
                     for line in response.iter_lines():
@@ -1160,6 +1267,9 @@ class TreeholeRAGAgent:
                                     chunk = json.loads(data_str)
                                     if 'choices' in chunk and len(chunk['choices']) > 0:
                                         delta = chunk['choices'][0].get('delta', {})
+                                        reasoning_content = self._extract_reasoning_content(delta)
+                                        if reasoning_content:
+                                            full_reasoning_content += reasoning_content
                                         if delta.get('tool_calls') and tool_calls_raw is None:
                                             tool_calls_raw = delta['tool_calls']
                                         content = delta.get('content', '')
@@ -1173,11 +1283,19 @@ class TreeholeRAGAgent:
                                     continue
 
                     if tool_calls_raw:
-                        return {"content": None, "tool_calls": tool_calls_raw}
-                    return {"content": full_content, "tool_calls": None}
+                        return {
+                            "content": full_content,
+                            "tool_calls": tool_calls_raw,
+                            "reasoning_content": full_reasoning_content,
+                        }
+                    return {
+                        "content": full_content,
+                        "tool_calls": None,
+                        "reasoning_content": full_reasoning_content,
+                    }
                 else:
                     response = requests.post(
-                        f"{self.api_base}/chat/completions",
+                        url,
                         headers=headers,
                         json=req_data,
                         timeout=120,
@@ -1189,9 +1307,10 @@ class TreeholeRAGAgent:
                     return {
                         "content": message.get("content"),
                         "tool_calls": message.get("tool_calls"),
+                        "reasoning_content": self._extract_reasoning_content(message),
                     }
             except Exception as e:
-                detail_lower = self._extract_deepseek_error_detail(e).lower()
+                detail_lower = self._extract_llm_error_detail(e).lower()
                 if (
                     use_parallel_tool_calls
                     and "parallel_tool_calls" in detail_lower
@@ -1200,13 +1319,13 @@ class TreeholeRAGAgent:
                     use_parallel_tool_calls = False
                     continue
 
-                if attempt < DEEPSEEK_RETRY_MAX_ATTEMPTS and self._is_retryable_deepseek_error(e):
-                    self._wait_before_deepseek_retry(attempt, e)
+                if attempt < LLM_RETRY_MAX_ATTEMPTS and self._is_retryable_llm_error(e):
+                    self._wait_before_llm_retry(attempt, e)
                     continue
 
-                error_detail = self._extract_deepseek_error_detail(e)
-                print(f"{AGENT_PREFIX}错误: DeepSeek API 调用失败 - {error_detail}")
-                return {"content": None, "tool_calls": None}
+                error_detail = self._extract_llm_error_detail(e)
+                print(f"{AGENT_PREFIX}错误: LLM API 调用失败 - {error_detail}")
+                return {"content": None, "tool_calls": None, "reasoning_content": None}
 
     # ------------------------------------------------------------------ #
     #         Internal: execute one round of search-then-answer           #
@@ -1229,7 +1348,7 @@ class TreeholeRAGAgent:
 
         while phase_used < phase_max:
             self._inject_task_memory_snapshot(messages)
-            response = self._call_deepseek_with_tools(
+            response = self._call_llm_with_tools(
                 messages,
                 [self.SEARCH_TOOL, self.GET_POST_TOOL, self.GET_COMMENT_TOOL],
                 stream=False,
@@ -1239,13 +1358,13 @@ class TreeholeRAGAgent:
             if not tool_calls:
                 break
 
-            assistant_msg: Dict[str, Any] = {
-                "role": "assistant",
-                "tool_calls": tool_calls,
-            }
-            if response.get("content"):
-                assistant_msg["content"] = response["content"]
-            messages.append(assistant_msg)
+            messages.append(
+                self._build_assistant_message(
+                    content=response.get("content"),
+                    tool_calls=tool_calls,
+                    reasoning_content=response.get("reasoning_content"),
+                )
+            )
 
             for tool_call in tool_calls:
                 name = tool_call["function"]["name"]
@@ -1506,7 +1625,7 @@ class TreeholeRAGAgent:
             "role": "user",
             "content": "好的，你已经完成了所有搜索。请现在基于你已经检索到的所有树洞内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造信息；如果信息不足请诚实说明。",
         })
-        response = self._call_deepseek_with_tools(messages, tools=[], stream=True)
+        response = self._call_llm_with_tools(messages, tools=[], stream=True)
         final_answer = response.get("content") or ""
 
         print("\n")
@@ -1688,11 +1807,16 @@ class TreeholeRAGAgent:
             "content": "请基于你已经检索到的所有树洞内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造信息；如果信息不足请诚实说明。",
         })
 
-        response = self._call_deepseek_with_tools(self._conversation_history, tools=[], stream=True)
+        response = self._call_llm_with_tools(self._conversation_history, tools=[], stream=True)
         final_answer = response.get("content") or ""
 
         # Save assistant reply to history for next turn
-        self._conversation_history.append({"role": "assistant", "content": final_answer})
+        self._conversation_history.append(
+            self._build_assistant_message(
+                content=final_answer,
+                reasoning_content=response.get("reasoning_content"),
+            )
+        )
 
         print("\n")
         print_separator("-")

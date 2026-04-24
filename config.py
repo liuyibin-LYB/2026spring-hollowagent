@@ -14,11 +14,26 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 USERNAME = "2xx00xxxxx"  # Replace with your student ID
 PASSWORD = "xxxxxx"      # Replace with your password
 
-# ==================== DeepSeek API Configuration ====================
-# Get your API key from: https://platform.deepseek.com/
-DEEPSEEK_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-DEEPSEEK_API_BASE = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-chat"  # or "deepseek-reasoner"
+# ==================== LLM API Configuration ====================
+# Any OpenAI-compatible chat-completions endpoint should work here.
+LLM_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+LLM_API_BASE = "https://api.deepseek.com"
+LLM_MODEL = "deepseek-v4-pro"
+
+# Optional overrides for non-default compatible backends.
+LLM_CHAT_COMPLETIONS_PATH = "/chat/completions"
+LLM_EXTRA_HEADERS = {}
+LLM_EXTRA_BODY = {}
+LLM_ENABLE_PARALLEL_TOOL_CALLS = True
+# Unified reasoning knob:
+# - OpenAI GPT-5.4-style models: none / low / medium / high / xhigh
+# - DeepSeek V4-style models: high / max (low/medium -> high, xhigh -> max, none -> thinking disabled)
+LLM_REASONING_EFFORT = "high"
+# Optional thinking toggle for compatible backends such as DeepSeek V4.
+# Use "auto" in most cases; set to "disabled" to force non-thinking mode.
+LLM_THINKING_TYPE = "auto"
+LLM_RETRY_MAX_ATTEMPTS = 5
+LLM_RETRY_SLEEP_SECONDS = 5
 
 # ==================== Agent Configuration ====================
 # --- Quick Tuning（模式2常调参数） ---

@@ -66,7 +66,7 @@ def example_custom_parameters():
 
     context = format_posts_batch(posts[:5])
 
-    response = agent.call_deepseek(
+    response = agent.call_llm(
         user_message=f"基于以下内容，总结一下转专业的难点：\n\n{context}",
         system_message="你是一个北大树洞分析助手",
         temperature=0.5,

@@ -52,7 +52,10 @@ sudo bash deploy_service.sh
    ```python
    USERNAME = "你的学号"
    PASSWORD = "你的密码"
-   DEEPSEEK_API_KEY = "sk-xxx..."  # 从 https://platform.deepseek.com/ 获取
+   LLM_API_KEY = "sk-xxx..."
+   LLM_API_BASE = "https://api.deepseek.com"   # 也可以换成其他 OpenAI-compatible 接口
+    LLM_MODEL = "deepseek-v4-pro"
+    LLM_REASONING_EFFORT = "high"   # GPT-5.4: none/low/medium/high/xhigh；DeepSeek V4 会自动映射到 high/max
    ```
 
 3. **运行 Agent**
