@@ -9,7 +9,7 @@ email_config.py
 email_bot/email_config.py
 
 # Private files
-todo_list.md
+docs/
 
 # Cookies and session files
 cookies.json
