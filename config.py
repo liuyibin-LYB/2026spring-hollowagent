@@ -36,11 +36,11 @@ LLM_RETRY_MAX_ATTEMPTS = 5
 LLM_RETRY_SLEEP_SECONDS = 5
 
 # ==================== Agent Configuration ====================
-# --- Quick Tuning（模式2常调参数） ---
+# --- Quick Tuning（常调参数） ---
 # 1) 每次搜索最多拉多少帖子（每次 search_treehole 上限）
 MAX_SEARCH_RESULTS = 40
 
-# 2) 最终上下文帖子上限（优先来自阶段B检索到的高质量帖子）
+# 2) 最终上下文帖子上限
 MAX_CONTEXT_POSTS = 30
 
 # 3) AI 选多少帖子做“深挖评论”
@@ -49,12 +49,12 @@ MAX_COMMENT_FETCH_POSTS = 6
 # 4) 每帖最多给 LLM 看多少评论（0=不看评论，-1=尽量全量）
 MAX_COMMENTS_PER_POST = 5
 
-# 5) 两阶段搜索次数（A:宽泛探索，B:高质量聚焦）
-# Stage A (broad exploration): discover aliases/slang/synonyms
+# 5) 软参考搜索次数（不再驱动硬编码阶段，只作为提示词参考）
+# Broad exploration hints: discover aliases/slang/synonyms
 BROAD_SEARCH_MIN = 10
 BROAD_SEARCH_MAX = 20
 
-# Stage B (high-quality focus): prioritize high reply/star posts
+# Focused research hints: prioritize high reply/star posts
 FOCUSED_SEARCH_MIN = 5
 FOCUSED_SEARCH_MAX = 10
 
@@ -84,6 +84,30 @@ CACHE_EXPIRATION = 86400
 # 评论补拉吞吐控制
 COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = 20.0
 COMMENT_FETCH_MAX_PARALLEL = 10
+SEARCH_MAX_REQUESTS_PER_SECOND = 6.0
+
+# 模式预算
+QUICK_QA_MAX_TURNS = 5
+QUICK_QA_MAX_TOOL_ROUNDS = 4
+QUICK_QA_SEARCH_BUDGET = 12
+DEEP_RESEARCH_MAX_TOOL_ROUNDS = 10
+DEEP_RESEARCH_SEARCH_BUDGET = 30
+
+# 会话与上下文
+SESSION_RECENT_TURNS = 5
+SESSION_CONTEXT_MAX_POSTS = 40
+
+# Daily 神帖模式（通过最近 PID 扫描）
+RECENT_PID_SCAN_HINT = 8000000
+RECENT_PID_SCAN_STEP = 120
+RECENT_PID_SCAN_MAX_PROBES = 60
+DAILY_DIGEST_RECENT_POSTS = 60
+DAILY_DIGEST_TOP_POSTS = 12
+
+# Thorough search
+# -1 表示尽量抓全；如果关键词过泛，建议在 config_private.py 中改成更小上限
+THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD = -1
+THOROUGH_SEARCH_MAX_CONTEXT_POSTS = 40
 
 # 搜索接口细节
 SEARCH_PAGE_LIMIT = 30

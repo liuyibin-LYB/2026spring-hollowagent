@@ -1,12 +1,20 @@
 # PKU Treehole Search Agent
 
-基于北大树洞的 RAG（检索增强生成）智能问答系统，当前聚焦模式2自动检索问答。
+基于北大树洞的检索增强问答与研究工具。现在支持四类核心工作流：
 
-**🆕 新功能：邮件机器人** - 通过邮件远程查询，随时随地获取课程信息！
+1. `每日神帖汇总`
+2. `日常 Q&A`
+3. `Deep Research`
+4. `Thorough Search`
 
-## ⚡ 快速开始
+同时内置：
 
-### 方式 1: 命令行交互
+- LLM 请求实时状态显示（请求开始、首个思考片段、首个输出片段、总耗时）
+- 历史会话列表、查看、恢复
+- compact 上下文缓存，避免对话上下文无限膨胀
+- 搜索缓存、评论并发抓取、任务 memory
+
+## 快速开始
 
 ```bash
 git clone git@github.com:SunVapor/pku-treehole-search-agent.git
@@ -14,306 +22,216 @@ cd ./pku-treehole-search-agent
 bash start.sh
 ```
 
-### 方式 2: 邮件机器人 🆕
-
-通过邮件远程查询，无需登录服务器！
+或手动：
 
 ```bash
-cd ~/pku-treehole-search-agent/email_bot
-
-# 1. 配置邮箱
-cp email_config_template.py email_config.py
-# 编辑 email_config.py 填入邮箱信息
-
-# 2. 启动邮件机器人
-bash start_email_bot.sh
-
-# 或部署为系统服务（开机自启）
-sudo bash deploy_service.sh
+pip install requests
+cp config.py config_private.py
+python agent.py
 ```
 
-发送邮件到配置的邮箱，主题包含 `树洞` 即可自动回复！
-
-详见 [email_bot/README.md](email_bot/README.md)
-
-### 手动配置
-
-1. **安装依赖**
-   ```bash
-   pip install requests
-   ```
-
-2. **配置账号**
-   ```bash
-   cp config.py config_private.py
-   ```
-   
-   编辑 `config_private.py`：
-   ```python
-   USERNAME = "你的学号"
-   PASSWORD = "你的密码"
-   LLM_API_KEY = "sk-xxx..."
-   LLM_API_BASE = "https://api.deepseek.com"   # 也可以换成其他 OpenAI-compatible 接口
-    LLM_MODEL = "deepseek-v4-pro"
-    LLM_REASONING_EFFORT = "high"   # GPT-5.4: none/low/medium/high/xhigh；DeepSeek V4 会自动映射到 high/max
-   ```
-
-3. **运行 Agent**
-   ```bash
-   python3 agent.py
-   ```
-
-## 🎯 功能特性
-
-### 核心模式
-
-#### 模式 2: 智能自动检索 🆕⭐
-- **只需输入自然语言问题**
-- **LLM 自主决策搜索策略**
-- **支持两阶段多轮搜索（A宽泛探索 + B高质量聚焦）**
-- **工作流程**：
-   1. LLM 分析问题并决定搜索关键词
-   2. 阶段A宽泛探索，识别黑话/别称/简称
-   3. 阶段B高质量聚焦，优先高 reply/star 帖子
-   4. 对高价值帖子补拉评论
-   5. 综合检索结果给出最终回答
-- **类似 MCP 工具调用模式**：LLM 像使用工具一样调用搜索功能
-
-### 核心特性
-
-- ✅ 流式输出（实时显示 AI 回答）
-- ✅ 检索内容预览（先看数据源，再看分析）
-- ✅ 搜索结果缓存（避免重复请求）
-- ✅ Cookie 持久化（免重复登录）
-- ✅ 智能 Token 优化
-
-
-## ⚙️ 配置说明
-
-建议先改这一组模式2常调参数（在 `config_private.py` 中修改）：
+在 `config_private.py` 中填入：
 
 ```python
-# --- Quick Tuning（模式2常调）---
-MAX_SEARCH_RESULTS = 40              # 每次搜索最多拉取帖子数
-MAX_CONTEXT_POSTS = 30               # 最终上下文帖子上限（优先阶段B帖子）
-MAX_COMMENT_FETCH_POSTS = 6          # AI 选中“深挖评论”的帖子上限
-MAX_COMMENTS_PER_POST = 5            # 每帖评论上限（0禁用，-1尽量全量）
-BROAD_SEARCH_MIN = 10
-BROAD_SEARCH_MAX = 20
-FOCUSED_SEARCH_MIN = 5
-FOCUSED_SEARCH_MAX = 10
-TEMPERATURE = 0.7
-MAX_RESPONSE_TOKENS = 4096
+USERNAME = "你的学号"
+PASSWORD = "你的密码"
+LLM_API_KEY = "sk-xxx"
+LLM_API_BASE = "https://api.deepseek.com"
+LLM_MODEL = "deepseek-v4-pro"
+```
+
+## 现在的四种模式
+
+### 1. 每日神帖汇总
+
+用途：
+
+- 扫描最近一批 PID
+- 按热度/质量筛选高价值帖子
+- 生成“今日神帖”汇总
+
+实现要点：
+
+- 没有依赖树洞“热门榜”接口，而是通过最近 PID 扫描获取新帖
+- `reply` 越多越偏热度
+- `star` 越多越偏质量/收藏价值
+
+产物会保存在 `data/daily_digest/<timestamp>/`。
+
+### 2. 日常 Q&A
+
+用途：
+
+- 五轮以内的连续追问
+- 快速检索、快速补评论、快速回答
+
+特点：
+
+- 默认 CLI 模式
+- 会把会话保存成独立 session
+- 会优先重用当前 session 的 compact 证据缓存
+
+### 3. Deep Research
+
+用途：
+
+- 让 LLM 在预算内自主决定研究方向
+- 更强调渐进式摸底、转向、聚焦和总结
+
+特点：
+
+- 不再把阶段 A/B 写死在流程里
+- 可以先广后窄，但是否切换由模型自己判断
+- 一旦发现关键帖子，就尽快抓取评论
+
+### 4. Thorough Search
+
+用途：
+
+- 用户手工指定关键词
+- 把这些关键词下的帖子和评论尽量抓全
+- 保存大语料文件，再做问答
+
+产物会保存在 `data/thorough_search/<timestamp>_<slug>/`，包括：
+
+- `corpus.json`
+- `corpus.md`
+- `corpus_index.md`
+- `answer.md`（如果同时给了问题）
+
+这个工作流参考了 [PKU_Treehole_Starred_Saver](https://github.com/EmptyBlueBox/PKU_Treehole_Starred_Saver) 的思路：把“原始抓取产物”和“便于阅读/后处理的导出产物”分开存，并显式关注速率和并发。
+
+## CLI 命令
+
+启动后，直接输入问题会走默认模式（默认是 `quick`）。
+
+可用命令：
+
+```text
+/help
+/mode quick|deep
+/daily [N]
+/thorough kw1,kw2 | 问题
+/sessions
+/resume <session_id>
+/history [session_id]
+/new
+/reset
+/save
+/quit
+```
+
+说明：
+
+- `/mode quick|deep`：切换“直接输入问题”时的默认模式
+- `/daily [N]`：扫描最近 `N` 个有效帖子候选并生成日报
+- `/thorough kw1,kw2 | 问题`：先抓全关键词语料，再回答问题
+- `/sessions`：查看历史会话列表
+- `/resume <session_id>`：恢复指定会话
+- `/history [session_id]`：查看当前或指定会话内容
+
+## 搜索工具的重要限制
+
+这部分也会同步注入给 LLM：
+
+- `search_treehole` 只能搜主帖正文，搜不到评论里的关键词
+- 多关键词搜索是严格匹配，关键词越多越容易漏结果
+- 英文更接近完整词匹配，不稳定支持前缀匹配
+- 搜索结果默认按发布时间从新到旧排序，不按热度排序
+
+因此推荐：
+
+- 一轮内发出多次短关键词搜索
+- 发现关键 PID 后尽快抓单帖和评论
+- 不要把希望寄托在“一次超长关键词搜索”上
+
+## 运行时可见性
+
+现在会实时打印：
+
+- LLM 请求开始
+- 首个思考片段延迟
+- 首个输出片段延迟
+- LLM 总耗时
+- 每个工具调用的开始/结束/缓存命中
+- 评论抓取统计
+
+## 上下文与会话管理
+
+旧版本会把越来越多的完整上下文直接堆进对话历史里。现在改成了两层：
+
+1. `data/sessions/<session_id>.json`
+   - 保存会话标题、模式、轮次、搜索次数、已抓帖子
+2. `data/context_cache/<session_id>.json`
+   - 保存 compact 过的帖子/评论摘要
+
+这样做的好处：
+
+- 恢复会话时更像“继续工作”而不是“继续堆 prompt”
+- 历史可浏览、可恢复
+- 新一轮回答主要依赖 compact 证据缓存和最近几轮对话
+
+## 配置项
+
+`config.py` / `config_private.py` 中常用的新参数：
+
+```python
+MAX_SEARCH_RESULTS = 40
+MAX_CONTEXT_POSTS = 30
+MAX_COMMENT_FETCH_POSTS = 6
+MAX_COMMENTS_PER_POST = 5
+
 SEARCH_DELAY_MIN = 1.0
 SEARCH_DELAY_MAX = 3.0
-ENABLE_CACHE = True
-CACHE_EXPIRATION = 86400
+SEARCH_MAX_REQUESTS_PER_SECOND = 6.0
 
-# --- Fixed Defaults（通常不改）---
-COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = 20.0
-COMMENT_FETCH_MAX_PARALLEL = 10
-SEARCH_PAGE_LIMIT = 30
-SEARCH_COMMENT_LIMIT = 10
-INCLUDE_IMAGE_POSTS = True
+QUICK_QA_MAX_TURNS = 5
+QUICK_QA_MAX_TOOL_ROUNDS = 4
+QUICK_QA_SEARCH_BUDGET = 12
+
+DEEP_RESEARCH_MAX_TOOL_ROUNDS = 10
+DEEP_RESEARCH_SEARCH_BUDGET = 30
+
+RECENT_PID_SCAN_HINT = 8000000
+RECENT_PID_SCAN_STEP = 120
+RECENT_PID_SCAN_MAX_PROBES = 60
+DAILY_DIGEST_RECENT_POSTS = 60
+DAILY_DIGEST_TOP_POSTS = 12
+
+THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD = -1
+THOROUGH_SEARCH_MAX_CONTEXT_POSTS = 40
 ```
 
-## 📁 项目结构
+说明：
 
-```
+- 现在不再依赖“硬编码阶段 A/B 次数”驱动主流程
+- `BROAD_SEARCH_*` / `FOCUSED_SEARCH_*` 仍保留，主要作为提示词中的软参考
+
+## 项目结构
+
+```text
 pku-treehole-search-agent/
-├── agent.md               # Agent 持久经验库（黑话、策略、工具说明）
-├── README.md              # 项目文档
-├── start.sh               # 一键启动脚本
-├── config.py              # 配置模板
-├── config_private.py      # 私有配置（自动创建）
-├── client.py              # 树洞 API 客户端
-├── agent.py               # RAG Agent 主逻辑
-├── utils.py               # 工具函数
-├── email_bot/             # 邮件机器人 🆕
-│   ├── README.md          # 邮件机器人文档
-│   ├── bot_email.py       # 邮件机器人主程序
-│   ├── email_config_template.py  # 配置模板
-│   └── ...                # 其他脚本和配置
-└── data/
-   ├── cache/             # 搜索结果缓存
-   └── task_memory/       # 单次任务/对话临时 memory（memory_时间戳.md）
+├── agent.py
+├── agent.md
+├── client.py
+├── config.py
+├── README.md
+├── data/
+│   ├── cache/
+│   ├── context_cache/
+│   ├── daily_digest/
+│   ├── sessions/
+│   ├── task_memory/
+│   └── thorough_search/
+└── email_bot/
 ```
 
-## 🔧 API 实现细节
+## 兼容性说明
 
-### 树洞搜索 API
+- `mode_auto_search()` 现在默认走 `Deep Research`
+- `mode_auto_search_multi_turn()` 现在默认走 `日常 Q&A`
+- 老的 `save_conversation()` / `load_conversation()` 仍可用，但底层已经切到 session 文件
 
-**端点**: `GET /chapi/api/v3/hole/list_comments`
+## License
 
-**参数**:
-- `keyword`: 搜索关键词
-- `page`: 页码
-- `limit`: 每页帖子数
-- `comment_limit`: 每个帖子返回的评论数
-
-**当前实现补充**:
-- 支持分页拉取，直到达到 `MAX_SEARCH_RESULTS` 或无更多结果
-- 支持通过 `INCLUDE_IMAGE_POSTS` 过滤图片帖（不下载图片文件）
-- 模式2采用“两阶段策略”：先进行 10-20 次宽泛探索（识别黑话/别称），再进行 5-10 次高质量聚焦（优先 reply/star）
-- 阶段A第一次搜索会展示“每帖最多 3 条评论预览”（来自 search 接口返回的 `comment_list`），用于快速识别黑话语境，后续不重复预览
-- 在已知 PID 的情况下，模型可直接调用 `get_post_by_pid` 获取单帖，减少无效搜索上下文
-- 在已确定高价值 PID 后，模型可调用 `get_comments_by_pid` 精确补拉评论
-- 模式2在 `MAX_SEARCH_RESULTS` 范围内让 AI 选择 `MAX_COMMENT_FETCH_POSTS` 个高价值帖子，再按 `MAX_CONTEXT_POSTS` 组装上下文并仅对入选上下文的已选帖子补拉评论
-- 补拉评论阶段使用受控并发 + 请求速率上限，默认通过 `COMMENT_FETCH_MAX_PARALLEL` 与 `COMMENT_FETCH_MAX_REQUESTS_PER_SECOND` 限制压力
-- 自动检索的系统提示词会注入 `agent.md`（持久经验库）与单次任务临时 memory（`data/task_memory/`）
-
-**响应格式**:
-```json
-{
-  "code": 20000,
-  "data": {
-    "list": [
-      {
-        "pid": 8001234,
-        "text": "帖子内容",
-        "comment_total": 45,
-        "comment_list": [...]
-      }
-    ],
-    "total": 15
-  }
-}
-```
-
-### 认证系统
-
-#### 登录流程
-1. **OAuth 登录**: `oauth_login(username, password)` → 获取 token
-2. **SSO 登录**: `sso_login(token)` → 获取 authorization
-3. **额外验证**（如需要）:
-   - SMS 验证: `send_message()` + `login_by_message(code)`
-   - Mobile Token: `login_by_token(code)` ⚠️ 注意：参数名为 `code`
-
-#### Cookie 持久化
-- 默认保存在项目目录下的 `.treehole_cookies.json`
-- 如需自定义路径，可在初始化 `TreeholeRAGAgent` 时传入 `cookies_file`
-- 自动加载和保存，避免频繁登录
-
-#### 非交互模式 🆕
-```python
-# 后台服务部署时使用非交互模式
-agent = TreeholeRAGAgent(interactive=False)
-
-# 交互模式（命令行使用）
-agent = TreeholeRAGAgent(interactive=True)  # 默认
-```
-
-**用途**:
-- `interactive=False`: 无法读取 stdin，登录失败时直接返回（适合systemd服务）
-- `interactive=True`: 可以提示用户输入验证码/token（适合命令行）
-
-**首次部署**:
-```bash
-# 1. 先交互式登录一次，保存 cookies
-python3 agent.py
-
-# 2. 然后部署为服务（会自动使用保存的 cookies）
-cd email_bot && sudo bash deploy_service.sh
-```
-
-### 评论获取 API
-
-**端点**: `GET /api/pku_comment_v3/{pid}`
-
-**参数**:
-- `page`: 页码
-- `limit`: 每页评论数
-- `sort`: 排序方式（`asc` / `desc`）
-
-**特性**:
-- 模式2会按策略对高价值帖子补拉评论
-- 支持分页，自动合并结果
-
-### 发给 AI 的帖子打包字段
-
-在模式2的上下文构造中，Agent 会把帖子和评论整理成稳定字段后再发送给 LLM，包含：
-
-- 帖子编号：`pid`
-- 帖子 reply 数：`reply_count`（来自 `reply`）
-- 帖子 star 数：`star_count`（来自 `likenum`）
-- 帖子发表时间：`post_time`（由 `timestamp` 格式化）
-- 评论回复时间：`reply_time`（由评论 `timestamp` 格式化）
-- 是否有图片：`has_image`（由 `type` / `media_ids` 推断）
-
-这些字段会以文本元数据形式写入上下文，便于 LLM 在回答时引用。
-
-## 🚨 故障排除
-
-### 问题 1: 登录失败 / 需要令牌验证
-
-**现象**: 登录时提示 "Mobile token:" 或 "请进行令牌验证"
-
-**解决方案**:
-```bash
-# 删除旧 cookie
-rm ./.treehole_cookies.json
-
-# 交互式重新登录
-python3 agent.py
-
-# 输入你的 PKU 手机令牌（6位数字，从 PKU Helper App 获取）
-```
-
-**邮件机器人部署**:
-```bash
-# 1. 先在命令行交互式登录，保存 cookies
-python3 agent.py
-
-# 2. 然后重启邮件机器人服务
-sudo systemctl restart treehole-email-bot
-```
-
-### 问题 2: DeepSeek API 错误
-
-**检查**:
-- API Key 是否正确
-- 网络连接是否正常
-- 账户余额是否充足
-
-### 问题 3: 搜索限流
-
-**解决**: 增加请求延迟
-```python
-# 在 config_private.py 中
-SEARCH_DELAY_MIN = 1.5
-SEARCH_DELAY_MAX = 3.5
-```
-
-### 问题 4: 邮件机器人无法启动
-
-**检查日志**:
-```bash
-# 查看服务状态
-sudo systemctl status treehole-email-bot
-
-# 查看详细日志
-tail -f ~/pku-treehole-search-agent/logs/bot.log
-```
-
-**常见原因**:
-- **EOF when reading a line**: Cookies 已过期，需要交互式重新登录
-- **Failed to login**: 检查 `config_private.py` 中的账号密码
-- **IMAP/SMTP error**: 检查 `email_config.py` 中的邮箱授权码
-
-## 💡 注意事项
-
-1. **隐私安全**
-   - `config_private.py` 已加入 `.gitignore`
-   - 不要将包含密码的文件提交到 Git
-
-2. **费用控制**
-   - DeepSeek API 按 Token 计费
-   - 通过 `MAX_CONTEXT_POSTS` 控制成本
-
-3. **搜索缓存**
-   - 默认缓存 24 小时
-   - 缓存文件保存在 `data/cache/`
-
-## 📝 开源协议
-
-MIT License
+MIT

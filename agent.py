@@ -20,13 +20,16 @@ import requests
 
 from client import TreeholeClient
 from utils import (
+    extract_keywords,
     format_posts_batch,
+    format_post_to_text,
     save_json,
     load_json,
     get_cache_key,
     is_cache_valid,
     print_header,
     print_separator,
+    truncate_text,
 )
 
 # Agent debug message prefix
@@ -36,6 +39,12 @@ AGENT_PREFIX = "[Agent] "
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 AGENT_KNOWLEDGE_FILE = os.path.join(PROJECT_DIR, "agent.md")
 TASK_MEMORY_DIR = os.path.join(PROJECT_DIR, "data", "task_memory")
+SESSIONS_DIR = os.path.join(PROJECT_DIR, "data", "sessions")
+ACTIVE_SESSION_FILE = os.path.join(PROJECT_DIR, "data", "active_session.json")
+CONTEXT_CACHE_DIR = os.path.join(PROJECT_DIR, "data", "context_cache")
+THOROUGH_SEARCH_DIR = os.path.join(PROJECT_DIR, "data", "thorough_search")
+DAILY_DIGEST_DIR = os.path.join(PROJECT_DIR, "data", "daily_digest")
+LATEST_PID_STATE_FILE = os.path.join(PROJECT_DIR, "data", "latest_pid_state.json")
 
 # Conversation history persistence file
 CONVERSATION_FILE = os.path.join(PROJECT_DIR, "data", "conversation_history.json")
@@ -80,8 +89,23 @@ COMMENT_FETCH_MAX_PARALLEL = getattr(_cfg, "COMMENT_FETCH_MAX_PARALLEL", 10)
 COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "COMMENT_FETCH_MAX_REQUESTS_PER_SECOND", 20.0)
 LLM_RETRY_MAX_ATTEMPTS = getattr(_cfg, "LLM_RETRY_MAX_ATTEMPTS", 5)
 LLM_RETRY_SLEEP_SECONDS = getattr(_cfg, "LLM_RETRY_SLEEP_SECONDS", 5)
+SEARCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "SEARCH_MAX_REQUESTS_PER_SECOND", 6.0)
+QUICK_QA_MAX_TURNS = getattr(_cfg, "QUICK_QA_MAX_TURNS", 5)
+QUICK_QA_MAX_TOOL_ROUNDS = getattr(_cfg, "QUICK_QA_MAX_TOOL_ROUNDS", 4)
+QUICK_QA_SEARCH_BUDGET = getattr(_cfg, "QUICK_QA_SEARCH_BUDGET", 12)
+DEEP_RESEARCH_MAX_TOOL_ROUNDS = getattr(_cfg, "DEEP_RESEARCH_MAX_TOOL_ROUNDS", 10)
+DEEP_RESEARCH_SEARCH_BUDGET = getattr(_cfg, "DEEP_RESEARCH_SEARCH_BUDGET", 30)
+RECENT_PID_SCAN_HINT = getattr(_cfg, "RECENT_PID_SCAN_HINT", 8000000)
+RECENT_PID_SCAN_STEP = getattr(_cfg, "RECENT_PID_SCAN_STEP", 120)
+RECENT_PID_SCAN_MAX_PROBES = getattr(_cfg, "RECENT_PID_SCAN_MAX_PROBES", 60)
+DAILY_DIGEST_RECENT_POSTS = getattr(_cfg, "DAILY_DIGEST_RECENT_POSTS", 60)
+DAILY_DIGEST_TOP_POSTS = getattr(_cfg, "DAILY_DIGEST_TOP_POSTS", 12)
+THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD = getattr(_cfg, "THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD", -1)
+THOROUGH_SEARCH_MAX_CONTEXT_POSTS = getattr(_cfg, "THOROUGH_SEARCH_MAX_CONTEXT_POSTS", max(MAX_CONTEXT_POSTS, 30))
+SESSION_RECENT_TURNS = getattr(_cfg, "SESSION_RECENT_TURNS", 5)
+SESSION_CONTEXT_MAX_POSTS = getattr(_cfg, "SESSION_CONTEXT_MAX_POSTS", max(MAX_CONTEXT_POSTS, 40))
 
-# Two-stage auto-search planning
+# Backward-compatible legacy knobs (still used in docs/prompts as soft hints)
 BROAD_SEARCH_MIN = getattr(_cfg, "BROAD_SEARCH_MIN", 10)
 BROAD_SEARCH_MAX = getattr(_cfg, "BROAD_SEARCH_MAX", 20)
 FOCUSED_SEARCH_MIN = getattr(_cfg, "FOCUSED_SEARCH_MIN", 5)
@@ -137,13 +161,13 @@ class TreeholeRAGAgent:
         "type": "function",
         "function": {
             "name": "search_treehole",
-            "description": "在北大树洞中搜索相关帖子。如果当前信息不足以回答问题，可以使用不同的关键词多次调用此函数。",
+            "description": "在北大树洞中按关键词搜索主帖。搜索只匹配主帖正文，不匹配评论；多关键词是严格同时匹配；英文按完整词匹配，不做前缀匹配；返回结果默认按发帖时间从新到旧排序。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "keyword": {
                         "type": "string",
-                        "description": "搜索关键词，精准的1-2个词，不要包含多个概念"
+                        "description": "搜索关键词。优先 1-2 个核心词；如果要扩大覆盖，宁可分多次搜，也不要把很多概念硬塞进一次搜索。"
                     },
                     "reason": {
                         "type": "string",
@@ -221,23 +245,61 @@ class TreeholeRAGAgent:
         "1) search_treehole: 关键词搜索帖子\n"
         "2) get_post_by_pid: 按 PID 精确抓取单帖\n"
         "3) get_comments_by_pid: 按 PID 精确抓取评论\n\n"
-        "建议采用两阶段策略（软约束，可自行判断收敛）：\n"
-        "阶段A（宽泛探索）: 建议 {broad_min}-{broad_max} 次搜索。"
-        "目标是识别黑话/别称/简称（课程、院系、老师）并扩展关键词。\n"
-        "阶段B（高质量聚焦）: 建议 {focused_min}-{focused_max} 次搜索。"
-        "优先寻找高价值帖子，最重要指标是 reply 与 star，其次是时间与内容相关性。\n\n"
+        "搜索工具特性：\n"
+        "- search_treehole 只能搜到主帖正文，搜不到评论里的关键词\n"
+        "- 多关键词搜索是严格匹配，关键词越多越容易漏掉结果\n"
+        "- 英文更接近完整词匹配，不会稳定匹配前缀变化\n"
+        "- 搜索结果默认按发帖时间从新到旧排序，不是按热度排序\n\n"
+        "帖子质量判断：\n"
+        "- 一般来说，reply 越多代表热度越高\n"
+        "- 一般来说，star 越多代表质量/收藏价值越高\n"
+        "- 时间和相关性仍然重要，不能只看热度\n\n"
+        "搜索策略：\n"
+        "- 可以先宽后窄，但不要把阶段写死；是否进入更聚焦的检索由你自行判断\n"
+        "- 评论信息通常也有价值；一旦帖子看起来重要，尽快补评论，不必等到某个固定阶段\n"
+        "- 单轮尽量多做几次工具调用（建议 4-8 个），优先一次性发出多组搜索请求提高效率\n\n"
         "执行规则：\n"
         "- 已知 PID 时优先用 get_post_by_pid，减少冗余检索\n"
-        "- 需要评论细节时用 get_comments_by_pid，避免在宽泛阶段过早拉评论\n"
-        "- 优先在同一轮一次性返回多个 tool_calls（建议 2-4 个），减少模型往返次数\n"
+        "- 需要评论细节时用 get_comments_by_pid，不要只停留在主帖标题级信息\n"
+        "- 优先在同一轮一次性返回多个 tool_calls（建议 4-8 个），减少模型往返次数\n"
         "- 仅当必须依赖上一批工具结果再决策时，才拆成下一轮调用\n"
-        "- 若当前信息已足够支持结论，可提前结束当前阶段并进入下一阶段或直接总结\n"
+        "- 若当前信息已足够支持结论，可直接总结，不需要机械分阶段\n"
         "- 搜索关键词优先 1-2 个核心词，必要时组合黑话\n"
         "- 严禁编造信息，只基于检索结果回答\n"
         "- 信息不足时明确说明\n"
         "- 保持客观，综合多条高质量帖子后再总结\n"
-        "- 在回答前，先确保高价值帖子已补充评论信息"
+        "- 在回答前，先确保真正关键的帖子已经补充评论信息\n\n"
+        "参考预算（软约束）：\n"
+        "- 宽泛探索可参考 {broad_min}-{broad_max} 次搜索\n"
+        "- 聚焦深入可参考 {focused_min}-{focused_max} 次搜索"
     )
+
+    MODE_PROFILES = {
+        "quick": {
+            "label": "日常Q&A",
+            "session_mode": True,
+            "max_turns": QUICK_QA_MAX_TURNS,
+            "max_tool_rounds": QUICK_QA_MAX_TOOL_ROUNDS,
+            "search_budget": QUICK_QA_SEARCH_BUDGET,
+            "search_results_per_call": min(MAX_SEARCH_RESULTS, 25),
+            "context_post_limit": min(SESSION_CONTEXT_MAX_POSTS, max(12, MAX_CONTEXT_POSTS)),
+            "comment_fetch_posts": min(MAX_COMMENT_FETCH_POSTS, max(6, MAX_COMMENT_FETCH_POSTS)),
+            "comment_limit": min(MAX_COMMENTS_PER_POST if MAX_COMMENTS_PER_POST > 0 else 8, 12) if MAX_COMMENTS_PER_POST != -1 else 12,
+            "query_style": "快速检索，优先解决当前问题，适合连续追问，默认控制在五轮以内。",
+        },
+        "deep": {
+            "label": "Deep Research",
+            "session_mode": True,
+            "max_turns": 999,
+            "max_tool_rounds": DEEP_RESEARCH_MAX_TOOL_ROUNDS,
+            "search_budget": DEEP_RESEARCH_SEARCH_BUDGET,
+            "search_results_per_call": max(MAX_SEARCH_RESULTS, 40),
+            "context_post_limit": max(SESSION_CONTEXT_MAX_POSTS, MAX_CONTEXT_POSTS),
+            "comment_fetch_posts": max(MAX_COMMENT_FETCH_POSTS, 12),
+            "comment_limit": MAX_COMMENTS_PER_POST,
+            "query_style": "在预算内渐进式研究，可先广泛摸底，再逐步聚焦，并自主决定研究方向。",
+        },
+    }
 
     def __init__(self, interactive=True, cookies_file=None):
         """Initialize the agent with Treehole client and an OpenAI-compatible LLM API.
@@ -260,11 +322,22 @@ class TreeholeRAGAgent:
         self._all_comments_cache: Dict[int, List[Dict[str, Any]]] = {}
         self.stream_callback = None  # Optional callback for streaming output
         self.info_callback = None    # Callback for progress/info messages
+        self._llm_request_seq = 0
+        self._tool_request_seq = 0
+        self._search_rate_limiter = _TokenBucket(SEARCH_MAX_REQUESTS_PER_SECOND)
 
-        # Multi-turn conversation state (mode 2)
+        # Session state
         self._conversation_history: List[Dict[str, Any]] = []
         self._conversation_searched_posts: List[Dict[str, Any]] = []
         self._conversation_search_count: int = 0
+        self._active_session_id: Optional[str] = None
+        self._session_mode: str = "quick"
+        self._session_title: str = ""
+        self._session_created_at: str = ""
+        self._session_updated_at: str = ""
+        self._session_turns: List[Dict[str, Any]] = []
+        self._session_posts: Dict[int, Dict[str, Any]] = {}
+        self._default_cli_mode: str = "quick"
         self._task_memory_file: Optional[str] = None
         self._agent_knowledge: str = ""
         self._last_memory_snapshot_hash: str = ""
@@ -273,8 +346,12 @@ class TreeholeRAGAgent:
         self._comment_fetch_stats: Dict[str, Any] = self._new_comment_fetch_stats()
         self._post_cache: Dict[int, Dict[str, Any]] = {}
 
-        # Load persistent agent knowledge and ensure per-task memory directory exists.
+        # Load persistent agent knowledge and ensure data directories exist.
         os.makedirs(TASK_MEMORY_DIR, exist_ok=True)
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        os.makedirs(CONTEXT_CACHE_DIR, exist_ok=True)
+        os.makedirs(THOROUGH_SEARCH_DIR, exist_ok=True)
+        os.makedirs(DAILY_DIGEST_DIR, exist_ok=True)
         self._agent_knowledge = self._load_agent_knowledge()
 
         # Ensure login
@@ -286,6 +363,12 @@ class TreeholeRAGAgent:
             os.makedirs(CACHE_DIR, exist_ok=True)
 
         print(f"{AGENT_PREFIX}✓ 树洞 RAG Agent 初始化成功")
+
+    def _emit_info(self, message: str) -> None:
+        """Print and forward user-visible runtime updates."""
+        print(f"{AGENT_PREFIX}{message}")
+        if self.info_callback:
+            self.info_callback(message)
 
     # ------------------------------------------------------------------ #
     #                        Random delay helpers                         #
@@ -359,6 +442,338 @@ class TreeholeRAGAgent:
         except Exception as e:
             print(f"{AGENT_PREFIX}加载 agent.md 失败: {e}")
             return ""
+
+    @staticmethod
+    def _now_str() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _slug_from_text(text: str, max_len: int = 24) -> str:
+        cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", "-", (text or "").strip())
+        cleaned = cleaned.strip("-_")
+        return (cleaned[:max_len] or "session").lower()
+
+    def _build_session_title(self, seed_text: str) -> str:
+        question = (seed_text or "").strip()
+        if not question:
+            return "未命名会话"
+        return truncate_text(question.replace("\n", " "), 40)
+
+    def _session_file(self, session_id: str) -> str:
+        return os.path.join(SESSIONS_DIR, f"{session_id}.json")
+
+    def _context_cache_file(self, session_id: str) -> str:
+        return os.path.join(CONTEXT_CACHE_DIR, f"{session_id}.json")
+
+    def _write_active_session_pointer(self) -> None:
+        if not self._active_session_id:
+            return
+        save_json(
+            {
+                "active_session_id": self._active_session_id,
+                "updated_at": self._now_str(),
+            },
+            ACTIVE_SESSION_FILE,
+        )
+
+    def _read_active_session_id(self) -> Optional[str]:
+        data = load_json(ACTIVE_SESSION_FILE) or {}
+        session_id = data.get("active_session_id")
+        return str(session_id) if session_id else None
+
+    def _reset_session_state(self) -> None:
+        self._conversation_history.clear()
+        self._conversation_searched_posts.clear()
+        self._conversation_search_count = 0
+        self._active_session_id = None
+        self._session_mode = self._default_cli_mode
+        self._session_title = ""
+        self._session_created_at = ""
+        self._session_updated_at = ""
+        self._session_turns = []
+        self._session_posts = {}
+        self._task_memory_file = None
+        self._last_memory_snapshot_hash = ""
+
+    def _new_session_id(self, seed_text: str) -> str:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{ts}_{self._slug_from_text(seed_text)}"
+
+    def _serialize_session(self) -> Dict[str, Any]:
+        posts = sorted(
+            [self._normalize_post_metadata(dict(post)) for post in self._session_posts.values() if post.get("pid")],
+            key=lambda item: int(item.get("pid", 0)),
+        )
+        return {
+            "session_id": self._active_session_id,
+            "title": self._session_title,
+            "mode": self._session_mode,
+            "created_at": self._session_created_at,
+            "updated_at": self._session_updated_at or self._now_str(),
+            "search_count": self._conversation_search_count,
+            "turns": self._session_turns,
+            "posts": posts,
+            "task_memory_file": self._task_memory_file,
+        }
+
+    def _persist_context_cache(self) -> None:
+        if not self._active_session_id:
+            return
+        ranked_posts = self._rank_posts_for_query(
+            list(self._session_posts.values()),
+            query=" ".join(turn.get("content", "") for turn in self._session_turns[-SESSION_RECENT_TURNS:]),
+            limit=min(SESSION_CONTEXT_MAX_POSTS, max(20, len(self._session_posts))),
+        )
+        compact = []
+        for post in ranked_posts:
+            comments = post.get("comments") or post.get("comment_list") or []
+            compact.append(
+                {
+                    "pid": post.get("pid"),
+                    "post_time": post.get("post_time"),
+                    "reply_count": post.get("reply_count", post.get("reply", 0)),
+                    "star_count": post.get("star_count", post.get("likenum", 0)),
+                    "comment_total": post.get("comment_total", len(comments)),
+                    "text_preview": self._compact_text_preview(post.get("text", ""), max_len=180),
+                    "comment_preview": [
+                        self._compact_text_preview(comment.get("text", ""), max_len=90)
+                        for comment in comments[:3]
+                    ],
+                }
+            )
+        save_json(
+            {
+                "session_id": self._active_session_id,
+                "updated_at": self._now_str(),
+                "posts": compact,
+            },
+            self._context_cache_file(self._active_session_id),
+        )
+
+    def _save_session(self) -> None:
+        if not self._active_session_id:
+            return
+        self._session_updated_at = self._now_str()
+        payload = self._serialize_session()
+        save_json(payload, self._session_file(self._active_session_id))
+        self._persist_context_cache()
+        self._write_active_session_pointer()
+        save_json(
+            {
+                "active_session_id": self._active_session_id,
+                "history": self._session_turns,
+                "search_count": self._conversation_search_count,
+                "mode": self._session_mode,
+            },
+            CONVERSATION_FILE,
+        )
+
+    def _load_session_payload(self, payload: Dict[str, Any]) -> bool:
+        session_id = payload.get("session_id")
+        if not session_id:
+            return False
+        self._reset_session_state()
+        self._active_session_id = str(session_id)
+        self._session_mode = str(payload.get("mode") or "quick")
+        self._default_cli_mode = self._session_mode if self._session_mode in self.MODE_PROFILES else "quick"
+        self._session_title = str(payload.get("title") or "未命名会话")
+        self._session_created_at = str(payload.get("created_at") or self._now_str())
+        self._session_updated_at = str(payload.get("updated_at") or self._session_created_at)
+        self._conversation_search_count = int(payload.get("search_count") or 0)
+        self._session_turns = list(payload.get("turns") or [])
+        self._task_memory_file = payload.get("task_memory_file") or None
+        raw_posts = payload.get("posts") or []
+        self._session_posts = {}
+        for post in raw_posts:
+            normalized = self._normalize_post_metadata(dict(post))
+            pid = normalized.get("pid")
+            if pid:
+                self._session_posts[int(pid)] = normalized
+        self._conversation_searched_posts = list(self._session_posts.values())
+        return True
+
+    def _begin_new_session(self, seed_text: str, profile: str) -> None:
+        self._reset_session_state()
+        self._active_session_id = self._new_session_id(seed_text)
+        self._session_mode = profile
+        self._session_title = self._build_session_title(seed_text)
+        self._session_created_at = self._now_str()
+        self._session_updated_at = self._session_created_at
+        self._start_task_memory(seed_text, mode=profile)
+        self._save_session()
+        self._emit_info(f"已创建新会话: {self._session_title} ({self._active_session_id})")
+
+    def _load_session_by_id(self, session_id: str) -> bool:
+        session_path = self._session_file(session_id)
+        if not os.path.exists(session_path):
+            return False
+        payload = load_json(session_path)
+        if not isinstance(payload, dict):
+            return False
+        ok = self._load_session_payload(payload)
+        if ok:
+            self._write_active_session_pointer()
+        return ok
+
+    def _load_latest_session(self) -> bool:
+        active_session_id = self._read_active_session_id()
+        if active_session_id and self._load_session_by_id(active_session_id):
+            return True
+        sessions = self.list_sessions()
+        if sessions:
+            return self._load_session_by_id(sessions[0]["session_id"])
+        return False
+
+    def _ensure_session_for_mode(self, profile: str, seed_text: str) -> None:
+        session_turn_count = sum(1 for turn in self._session_turns if turn.get("role") == "user")
+        if not self._active_session_id:
+            self._begin_new_session(seed_text, profile)
+            return
+        if self._session_mode != profile:
+            self._save_session()
+            self._begin_new_session(seed_text, profile)
+            return
+        if profile == "quick" and session_turn_count >= QUICK_QA_MAX_TURNS:
+            self._save_session()
+            self._begin_new_session(seed_text, profile)
+            self._emit_info("快速问答会话已达到五轮上限，已自动开启新会话。")
+
+    def _append_session_turn(self, role: str, content: str, mode: Optional[str] = None, **extra: Any) -> None:
+        self._session_turns.append(
+            {
+                "role": role,
+                "content": content,
+                "mode": mode or self._session_mode,
+                "created_at": self._now_str(),
+                **extra,
+            }
+        )
+        self._session_updated_at = self._now_str()
+
+    def _upsert_session_posts(self, posts: List[Dict[str, Any]]) -> None:
+        for post in posts:
+            normalized = self._normalize_post_metadata(dict(post))
+            pid = normalized.get("pid")
+            if pid:
+                self._session_posts[int(pid)] = normalized
+        self._conversation_searched_posts = list(self._session_posts.values())
+
+    def _build_recent_turns_snippet(self, max_turns: int = SESSION_RECENT_TURNS) -> str:
+        if not self._session_turns:
+            return ""
+        snippets = []
+        relevant_turns = self._session_turns[-max_turns * 2:]
+        for turn in relevant_turns:
+            role = "用户" if turn.get("role") == "user" else "助手"
+            content = truncate_text(str(turn.get("content") or "").replace("\n", " "), 220)
+            snippets.append(f"- {role}: {content}")
+        return "\n".join(snippets)
+
+    def _rank_posts_for_query(
+        self,
+        posts: List[Dict[str, Any]],
+        query: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        tokens = [tok.lower() for tok in extract_keywords(query or "")]
+        ranked = []
+        for post in posts:
+            text = str(post.get("text") or "")
+            text_lower = text.lower()
+            reply_count = max(0, int(post.get("reply_count", post.get("reply", 0)) or 0))
+            star_count = max(0, int(post.get("star_count", post.get("likenum", 0)) or 0))
+            comment_total = max(0, int(post.get("comment_total", 0) or 0))
+            match_score = 0.0
+            if tokens:
+                hits = sum(1 for token in tokens if token and token in text_lower)
+                match_score = hits / max(1, len(tokens))
+            recency_score = int(post.get("pid", 0) or 0) / 1_000_000.0
+            score = match_score * 5.0 + star_count * 0.7 + reply_count * 0.5 + comment_total * 0.2 + recency_score
+            ranked.append((score, post))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [post for _, post in ranked[:max(1, limit)]]
+
+    def _build_compact_context_snippet(
+        self,
+        query: str,
+        limit: int = 18,
+        max_chars: int = 8000,
+    ) -> str:
+        if not self._session_posts:
+            return ""
+        ranked_posts = self._rank_posts_for_query(list(self._session_posts.values()), query=query, limit=limit)
+        lines = []
+        for post in ranked_posts:
+            pid = post.get("pid")
+            lines.append(
+                f"- pid={pid} | time={post.get('post_time')} | reply={post.get('reply_count', 0)} | "
+                f"star={post.get('star_count', 0)} | {self._compact_text_preview(post.get('text', ''), max_len=160)}"
+            )
+            comments = post.get("comments") or post.get("comment_list") or []
+            for idx, comment in enumerate(comments[:2], 1):
+                lines.append(f"  - 评论{idx}: {self._compact_text_preview(comment.get('text', ''), max_len=90)}")
+        compact = "\n".join(lines)
+        return compact[:max_chars]
+
+    def _save_text_artifact(self, path: str, content: str) -> str:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        sessions = []
+        if not os.path.exists(SESSIONS_DIR):
+            return sessions
+        for name in os.listdir(SESSIONS_DIR):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(SESSIONS_DIR, name)
+            payload = load_json(path)
+            if not isinstance(payload, dict):
+                continue
+            sessions.append(
+                {
+                    "session_id": payload.get("session_id") or name[:-5],
+                    "title": payload.get("title") or "未命名会话",
+                    "mode": payload.get("mode") or "quick",
+                    "updated_at": payload.get("updated_at") or "",
+                    "turns": sum(1 for turn in (payload.get("turns") or []) if turn.get("role") == "user"),
+                    "search_count": int(payload.get("search_count") or 0),
+                }
+            )
+        sessions.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+        return sessions
+
+    def render_session_list(self) -> str:
+        sessions = self.list_sessions()
+        if not sessions:
+            return "暂无历史会话。"
+        lines = []
+        for item in sessions[:20]:
+            lines.append(
+                f"- {item['session_id']} | {item['mode']} | {item['updated_at']} | "
+                f"{item['turns']}轮 | {item['search_count']}次搜索 | {item['title']}"
+            )
+        return "\n".join(lines)
+
+    def render_session_history(self, session_id: Optional[str] = None, max_turns: int = 12) -> str:
+        payload = None
+        if session_id:
+            payload = load_json(self._session_file(session_id))
+        elif self._active_session_id:
+            payload = self._serialize_session()
+        if not isinstance(payload, dict):
+            return "未找到会话。"
+        turns = payload.get("turns") or []
+        title = payload.get("title") or "未命名会话"
+        lines = [f"# {title}", ""]
+        for turn in turns[-max_turns * 2:]:
+            role = "你" if turn.get("role") == "user" else "助手"
+            lines.append(f"## {role}")
+            lines.append(str(turn.get("content") or "").strip())
+            lines.append("")
+        return "\n".join(lines).strip()
 
     def _start_task_memory(self, user_question: str, mode: str) -> None:
         """Create a per-task markdown memory file for this run/conversation."""
@@ -458,23 +873,33 @@ class TreeholeRAGAgent:
         max_comments: int = MAX_COMMENTS_PER_POST,
     ) -> Optional[Dict[str, Any]]:
         """Fetch one post by pid and optionally hydrate comments."""
+        tool_id = self._tool_request_seq = self._tool_request_seq + 1
+        start_ts = time.time()
         if pid in self._post_cache:
             cached_post = dict(self._post_cache[pid])
             if include_comments:
                 cached_post["comments"] = self._load_comments_for_post(cached_post, max_comments)
+            self._emit_info(
+                f"Tool#{tool_id} get_post_by_pid 命中缓存: pid={pid}, 耗时 {time.time() - start_ts:.2f}s"
+            )
             return cached_post
 
         try:
+            self._emit_info(f"Tool#{tool_id} get_post_by_pid 开始: pid={pid}")
             result = self.client.get_post(pid)
             if not result.get("success"):
+                self._emit_info(f"Tool#{tool_id} get_post_by_pid 未找到: pid={pid}")
                 return None
             post = self._normalize_post_metadata(result.get("data", {}))
             self._post_cache[pid] = dict(post)
             if include_comments:
                 post["comments"] = self._load_comments_for_post(post, max_comments)
+            self._emit_info(
+                f"Tool#{tool_id} get_post_by_pid 完成: pid={pid}, 耗时 {time.time() - start_ts:.2f}s"
+            )
             return post
         except Exception as e:
-            print(f"{AGENT_PREFIX}获取 PID {pid} 失败: {e}")
+            self._emit_info(f"Tool#{tool_id} get_post_by_pid 失败: pid={pid}, error={e}")
             return None
 
     def get_comments_by_pid(
@@ -484,14 +909,24 @@ class TreeholeRAGAgent:
         sort: str = "asc",
     ) -> List[Dict[str, Any]]:
         """Fetch comments by pid directly with pagination and global rate limit."""
+        tool_id = self._tool_request_seq = self._tool_request_seq + 1
+        start_ts = time.time()
         if pid in self._all_comments_cache:
             cached = self._all_comments_cache[pid]
             if max_comments == -1:
+                self._emit_info(
+                    f"Tool#{tool_id} get_comments_by_pid 命中缓存: pid={pid}, comments={len(cached)}, 耗时 {time.time() - start_ts:.2f}s"
+                )
                 return cached
-            return cached[:max_comments]
+            result = cached[:max_comments]
+            self._emit_info(
+                f"Tool#{tool_id} get_comments_by_pid 命中缓存: pid={pid}, comments={len(result)}, 耗时 {time.time() - start_ts:.2f}s"
+            )
+            return result
 
         comments: List[Dict[str, Any]] = []
         page = 1
+        self._emit_info(f"Tool#{tool_id} get_comments_by_pid 开始: pid={pid}, max_comments={max_comments}, sort={sort}")
         while True:
             self._comment_rate_limiter.acquire()
             self._record_comment_api_request()
@@ -517,8 +952,15 @@ class TreeholeRAGAgent:
 
         self._all_comments_cache[pid] = comments
         if max_comments == -1:
+            self._emit_info(
+                f"Tool#{tool_id} get_comments_by_pid 完成: pid={pid}, comments={len(comments)}, 耗时 {time.time() - start_ts:.2f}s"
+            )
             return comments
-        return comments[:max_comments]
+        result = comments[:max_comments]
+        self._emit_info(
+            f"Tool#{tool_id} get_comments_by_pid 完成: pid={pid}, comments={len(result)}, 耗时 {time.time() - start_ts:.2f}s"
+        )
+        return result
 
     @staticmethod
     def _new_comment_fetch_stats() -> Dict[str, Any]:
@@ -578,7 +1020,7 @@ class TreeholeRAGAgent:
             f"并发上限 {max(1, COMMENT_FETCH_MAX_PARALLEL)}, "
             f"速率上限 {COMMENT_FETCH_MAX_REQUESTS_PER_SECOND:.2f} req/s"
         )
-        print(f"{AGENT_PREFIX}{msg}")
+        self._emit_info(msg)
 
     @staticmethod
     def _compact_text_preview(text: str, max_len: int = 120) -> str:
@@ -670,7 +1112,7 @@ class TreeholeRAGAgent:
         max_selected: int,
     ) -> List[int]:
         """Fallback ranking when LLM selection fails."""
-        query_tokens = [tok.lower() for tok in re.split(r"\s+", (query or "").strip()) if tok]
+        query_tokens = [tok.lower() for tok in extract_keywords(query or "")]
 
         scored: List[Any] = []
         for post in posts:
@@ -786,9 +1228,9 @@ class TreeholeRAGAgent:
             return existing_comments
 
         if max_comments == -1:
-            print(f"{AGENT_PREFIX}  正在获取帖子 #{pid} 的全部 {comment_total} 条评论...")
+            self._emit_info(f"正在获取帖子 #{pid} 的全部 {comment_total} 条评论...")
         else:
-            print(f"{AGENT_PREFIX}  正在获取帖子 #{pid} 的评论（目标 {target_count} 条）...")
+            self._emit_info(f"正在获取帖子 #{pid} 的评论（目标 {target_count} 条）...")
 
         all_comments: List[Dict[str, Any]] = []
         page = 1
@@ -829,6 +1271,7 @@ class TreeholeRAGAgent:
         max_comments: int,
         selection_query: str = "",
         context_post_limit: Optional[int] = None,
+        selected_limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Hydrate context with AI-selected, rate-limited comment fetching.
 
@@ -841,11 +1284,12 @@ class TreeholeRAGAgent:
                 post["comments"] = []
             return normalized_posts
 
-        selected_limit = max(0, min(MAX_COMMENT_FETCH_POSTS, len(normalized_posts)))
+        effective_selected_limit = selected_limit if selected_limit is not None else MAX_COMMENT_FETCH_POSTS
+        effective_selected_limit = max(0, min(effective_selected_limit, len(normalized_posts)))
         selected_pids = self._select_posts_for_comment_fetch(
             normalized_posts,
             query=selection_query,
-            max_selected=selected_limit,
+            max_selected=effective_selected_limit,
         )
         selected_set = set(selected_pids)
 
@@ -861,13 +1305,13 @@ class TreeholeRAGAgent:
 
         effective_selected_set = {p.get("pid") for p in context_posts if p.get("pid") in selected_set}
 
-        print(
-            f"{AGENT_PREFIX}评论补拉策略: 候选 {len(normalized_posts)} 帖, "
+        self._emit_info(
+            f"评论补拉策略: 候选 {len(normalized_posts)} 帖, "
             f"AI 选择 {len(selected_pids)} 帖补拉评论, "
             f"上下文使用 {len(context_posts)} 帖"
         )
         if selected_pids:
-            print(f"{AGENT_PREFIX}AI 选中帖子 PID: {', '.join(str(pid) for pid in selected_pids)}")
+            self._emit_info(f"AI 选中帖子 PID: {', '.join(str(pid) for pid in selected_pids)}")
 
         comments_by_pid: Dict[int, List[Dict[str, Any]]] = {}
         if effective_selected_set:
@@ -893,7 +1337,7 @@ class TreeholeRAGAgent:
                         self._inc_comment_stat("completed_posts")
                     except Exception as e:
                         self._inc_comment_stat("failed_posts")
-                        print(f"{AGENT_PREFIX}  警告: 获取帖子 {pid} 的评论失败: {e}")
+                        self._emit_info(f"警告: 获取帖子 {pid} 的评论失败: {e}")
 
             self._log_comment_fetch_stats()
 
@@ -925,29 +1369,40 @@ class TreeholeRAGAgent:
         """
         Search Treehole for posts matching keyword.
         """
+        normalized_max_results = max_results
+        if normalized_max_results == 0:
+            return []
+        if normalized_max_results is None:
+            normalized_max_results = MAX_SEARCH_RESULTS
+
         # Check cache first
         if use_cache:
             cache_key = get_cache_key(
-                f"{keyword}|{max_results}|{SEARCH_PAGE_LIMIT}|{SEARCH_COMMENT_LIMIT}|{INCLUDE_IMAGE_POSTS}"
+                f"{keyword}|{normalized_max_results}|{SEARCH_PAGE_LIMIT}|{SEARCH_COMMENT_LIMIT}|{INCLUDE_IMAGE_POSTS}"
             )
             cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
 
             if is_cache_valid(cache_file, CACHE_EXPIRATION):
-                print(f"{AGENT_PREFIX}使用缓存结果: {keyword}")
+                self._emit_info(f"搜索缓存命中: {keyword}")
                 cached = load_json(cache_file) or []
                 return [self._normalize_post_metadata(post) for post in cached]
 
-        print(f"{AGENT_PREFIX}正在搜索树洞: {keyword}")
+        tool_id = self._tool_request_seq = self._tool_request_seq + 1
+        start_ts = time.time()
+        self._emit_info(f"Tool#{tool_id} search_treehole 开始: {keyword}")
 
         try:
             all_posts: List[Dict[str, Any]] = []
             page = 1
             search_comment_limit = self._resolve_search_comment_limit()
             page_limit = max(1, SEARCH_PAGE_LIMIT)
+            unlimited = normalized_max_results == -1
 
-            while len(all_posts) < max_results:
-                request_limit = min(page_limit, max_results - len(all_posts))
-                self._human_delay(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX, f"搜索请求 第{page}页")
+            while unlimited or len(all_posts) < normalized_max_results:
+                request_limit = page_limit if unlimited else min(page_limit, normalized_max_results - len(all_posts))
+                self._search_rate_limiter.acquire()
+                if SEARCH_DELAY_MAX > 0 or SEARCH_DELAY_MIN > 0:
+                    self._human_delay(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX, f"搜索请求 第{page}页")
 
                 search_result = self.client.search_posts(
                     keyword,
@@ -958,9 +1413,7 @@ class TreeholeRAGAgent:
 
                 if not search_result.get("success"):
                     msg = f"搜索失败: {search_result.get('message', '未知错误')}"
-                    print(f"{AGENT_PREFIX}{msg}")
-                    if self.info_callback:
-                        self.info_callback(msg)
+                    self._emit_info(msg)
                     break
 
                 page_posts = search_result.get("data", {}).get("data", [])
@@ -978,20 +1431,30 @@ class TreeholeRAGAgent:
                     break
                 page += 1
 
-            enriched_posts = all_posts[:max_results]
+            enriched_posts = all_posts if unlimited else all_posts[:normalized_max_results]
 
             if use_cache:
                 save_json(enriched_posts, cache_file)
 
-            msg = f"✓ 找到 {len(enriched_posts)} 个帖子"
-            print(f"{AGENT_PREFIX}{msg}")
-            if self.info_callback:
-                self.info_callback(msg)
+            msg = (
+                f"Tool#{tool_id} search_treehole 完成: {len(enriched_posts)} 帖, "
+                f"耗时 {time.time() - start_ts:.2f}s"
+            )
+            self._emit_info(msg)
             return enriched_posts
 
         except Exception as e:
-            print(f"{AGENT_PREFIX}搜索树洞时出错: {e}")
+            self._emit_info(f"Tool#{tool_id} search_treehole 失败: {e}")
             return []
+
+    def search_treehole_exhaustive(
+        self,
+        keyword: str,
+        use_cache: bool = ENABLE_CACHE,
+    ) -> List[Dict[str, Any]]:
+        """Fetch all pages for a keyword unless a config cap is specified."""
+        max_results = THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD
+        return self.search_treehole(keyword, max_results=max_results, use_cache=use_cache)
 
     # ------------------------------------------------------------------ #
     #                  OpenAI-compatible LLM API calls                    #
@@ -1147,6 +1610,12 @@ class TreeholeRAGAgent:
 
         for attempt in range(1, LLM_RETRY_MAX_ATTEMPTS + 1):
             try:
+                self._llm_request_seq += 1
+                request_id = self._llm_request_seq
+                start_ts = time.time()
+                self._emit_info(
+                    f"LLM#{request_id} 开始请求（stream={'on' if stream else 'off'}, messages={len(messages)}, attempt={attempt}）"
+                )
                 if stream:
                     response = requests.post(
                         url,
@@ -1158,6 +1627,8 @@ class TreeholeRAGAgent:
                     response.raise_for_status()
 
                     full_content = ""
+                    first_reasoning_ts = None
+                    first_output_ts = None
                     for line in response.iter_lines():
                         if line:
                             line_str = line.decode('utf-8')
@@ -1169,8 +1640,19 @@ class TreeholeRAGAgent:
                                     chunk = json.loads(data_str)
                                     if 'choices' in chunk and len(chunk['choices']) > 0:
                                         delta = chunk['choices'][0].get('delta', {})
+                                        reasoning = self._extract_reasoning_content(delta)
+                                        if reasoning and first_reasoning_ts is None:
+                                            first_reasoning_ts = time.time()
+                                            self._emit_info(
+                                                f"LLM#{request_id} 首个思考片段: {first_reasoning_ts - start_ts:.2f}s"
+                                            )
                                         content = delta.get('content', '')
                                         if content:
+                                            if first_output_ts is None:
+                                                first_output_ts = time.time()
+                                                self._emit_info(
+                                                    f"LLM#{request_id} 首个输出片段: {first_output_ts - start_ts:.2f}s"
+                                                )
                                             cb = self.stream_callback or callback
                                             if cb:
                                                 cb(content)
@@ -1182,6 +1664,9 @@ class TreeholeRAGAgent:
 
                     if not (self.stream_callback or callback):
                         print()
+                    self._emit_info(
+                        f"LLM#{request_id} 完成: {time.time() - start_ts:.2f}s, 输出 {len(full_content)} 字符"
+                    )
                     return full_content
                 else:
                     response = requests.post(
@@ -1192,6 +1677,9 @@ class TreeholeRAGAgent:
                     )
                     response.raise_for_status()
                     result = response.json()
+                    self._emit_info(
+                        f"LLM#{request_id} 完成: {time.time() - start_ts:.2f}s（非流式）"
+                    )
                     return result["choices"][0]["message"]["content"]
             except Exception as e:
                 if attempt < LLM_RETRY_MAX_ATTEMPTS and self._is_retryable_llm_error(e):
@@ -1237,10 +1725,16 @@ class TreeholeRAGAgent:
 
         for attempt in range(1, LLM_RETRY_MAX_ATTEMPTS + 1):
             try:
+                self._llm_request_seq += 1
+                request_id = self._llm_request_seq
+                start_ts = time.time()
                 req_data = dict(data)
                 if use_parallel_tool_calls:
                     # Hint model/runtime to emit multiple tool calls in one assistant turn.
                     req_data["parallel_tool_calls"] = True
+                self._emit_info(
+                    f"LLM#{request_id} 开始工具请求（stream={'on' if stream else 'off'}, tools={len(tools)}, messages={len(messages)}, attempt={attempt}）"
+                )
 
                 if stream:
                     response = requests.post(
@@ -1255,6 +1749,8 @@ class TreeholeRAGAgent:
                     full_content = ""
                     full_reasoning_content = ""
                     tool_calls_raw = None
+                    first_reasoning_ts = None
+                    first_output_ts = None
 
                     for line in response.iter_lines():
                         if line:
@@ -1269,11 +1765,21 @@ class TreeholeRAGAgent:
                                         delta = chunk['choices'][0].get('delta', {})
                                         reasoning_content = self._extract_reasoning_content(delta)
                                         if reasoning_content:
+                                            if first_reasoning_ts is None:
+                                                first_reasoning_ts = time.time()
+                                                self._emit_info(
+                                                    f"LLM#{request_id} 首个思考片段: {first_reasoning_ts - start_ts:.2f}s"
+                                                )
                                             full_reasoning_content += reasoning_content
                                         if delta.get('tool_calls') and tool_calls_raw is None:
                                             tool_calls_raw = delta['tool_calls']
                                         content = delta.get('content', '')
                                         if content:
+                                            if first_output_ts is None:
+                                                first_output_ts = time.time()
+                                                self._emit_info(
+                                                    f"LLM#{request_id} 首个输出片段: {first_output_ts - start_ts:.2f}s"
+                                                )
                                             if self.stream_callback:
                                                 self.stream_callback(content)
                                             else:
@@ -1283,11 +1789,17 @@ class TreeholeRAGAgent:
                                     continue
 
                     if tool_calls_raw:
+                        self._emit_info(
+                            f"LLM#{request_id} 完成: {time.time() - start_ts:.2f}s, tool_calls={len(tool_calls_raw)}, 输出 {len(full_content)} 字符"
+                        )
                         return {
                             "content": full_content,
                             "tool_calls": tool_calls_raw,
                             "reasoning_content": full_reasoning_content,
                         }
+                    self._emit_info(
+                        f"LLM#{request_id} 完成: {time.time() - start_ts:.2f}s, tool_calls=0, 输出 {len(full_content)} 字符"
+                    )
                     return {
                         "content": full_content,
                         "tool_calls": None,
@@ -1304,6 +1816,9 @@ class TreeholeRAGAgent:
                     result = response.json()
                     choice = result["choices"][0]
                     message = choice["message"]
+                    self._emit_info(
+                        f"LLM#{request_id} 完成: {time.time() - start_ts:.2f}s（非流式）"
+                    )
                     return {
                         "content": message.get("content"),
                         "tool_calls": message.get("tool_calls"),
@@ -1331,22 +1846,121 @@ class TreeholeRAGAgent:
     #         Internal: execute one round of search-then-answer           #
     # ------------------------------------------------------------------ #
 
-    def _execute_search_loop(
+    def _build_research_system_prompt(self, profile: str) -> str:
+        profile_cfg = self.MODE_PROFILES[profile]
+        return (
+            self._build_auto_search_system_prompt()
+            + "\n\n[当前模式]\n"
+            + f"- 模式: {profile_cfg['label']}\n"
+            + f"- 风格: {profile_cfg['query_style']}\n"
+            + f"- 工具轮次预算: {profile_cfg['max_tool_rounds']}\n"
+            + f"- search_treehole 预算: {profile_cfg['search_budget']}\n"
+            + f"- 每次 search_treehole 拉取帖子上限: {profile_cfg['search_results_per_call']}\n"
+            + f"- 最终上下文帖子上限: {profile_cfg['context_post_limit']}\n"
+        )
+
+    def _build_turn_messages(self, user_question: str, profile: str) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": self._build_research_system_prompt(profile),
+            }
+        ]
+        recent_turns = self._build_recent_turns_snippet()
+        if recent_turns:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "以下是最近几轮对话摘要，请只把它当作线索，不要被旧结论绑死：\n" + recent_turns,
+                }
+            )
+        compact_context = self._build_compact_context_snippet(
+            query=user_question,
+            limit=min(SESSION_CONTEXT_MAX_POSTS, 18),
+        )
+        if compact_context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "以下是当前会话的 compact 证据缓存（来自已抓到的帖子和评论摘要）：\n" + compact_context,
+                }
+            )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"当前用户问题：{user_question}\n"
+                    "请在预算内自主决定是先泛化还是先聚焦。优先一次性发出多条 tool_calls，提高效率；"
+                    "如果当前已有证据足够，也可以直接停止调用工具并准备总结。"
+                ),
+            }
+        )
+        return messages
+
+    def _hydrate_all_posts_with_comments(
         self,
-        messages: List[Dict],
-        all_searched_posts: List[Dict],
-        search_history: List[Dict],
-        search_count: int,
-        phase_max: int,
-        phase_name: str,
-        phase_posts: Optional[List[Dict[str, Any]]] = None,
-    ) -> int:
-        """Run one staged search loop with min/max search counts for this phase."""
+        posts: List[Dict[str, Any]],
+        max_comments: int = -1,
+    ) -> List[Dict[str, Any]]:
+        normalized_posts = [self._normalize_post_metadata(dict(post)) for post in posts if post.get("pid")]
+        if not normalized_posts:
+            return []
+        max_workers = max(1, min(COMMENT_FETCH_MAX_PARALLEL, len(normalized_posts)))
+        results: Dict[int, List[Dict[str, Any]]] = {}
+        self._reset_comment_fetch_stats(len(normalized_posts))
 
-        phase_used = 0
-        broad_preview_used = False
+        def fetch(post: Dict[str, Any]) -> Any:
+            pid = int(post["pid"])
+            comments = self._load_comments_for_post(post, max_comments=max_comments)
+            return pid, comments
 
-        while phase_used < phase_max:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(fetch, post): int(post["pid"]) for post in normalized_posts}
+            for future in as_completed(future_map):
+                pid = future_map[future]
+                try:
+                    _, comments = future.result()
+                    results[pid] = comments
+                    self._inc_comment_stat("completed_posts")
+                except Exception as e:
+                    self._inc_comment_stat("failed_posts")
+                    self._emit_info(f"批量评论抓取失败: pid={pid}, error={e}")
+
+        self._log_comment_fetch_stats()
+        hydrated = []
+        for post in normalized_posts:
+            pid = int(post["pid"])
+            post["comments"] = results.get(pid, post.get("comments") or post.get("comment_list") or [])
+            hydrated.append(post)
+        return hydrated
+
+    def _summarize_source_refs(self, posts: List[Dict[str, Any]], limit: int = 20) -> List[Dict[str, Any]]:
+        refs = []
+        for post in posts[:limit]:
+            refs.append(
+                {
+                    "pid": post.get("pid"),
+                    "text": self._compact_text_preview(post.get("text", ""), max_len=100),
+                }
+            )
+        return refs
+
+    def _execute_research_loop(
+        self,
+        messages: List[Dict[str, Any]],
+        working_posts: List[Dict[str, Any]],
+        search_history: List[Dict[str, Any]],
+        user_question: str,
+        profile: str,
+    ) -> None:
+        profile_cfg = self.MODE_PROFILES[profile]
+        max_tool_rounds = int(profile_cfg["max_tool_rounds"])
+        search_budget = int(profile_cfg["search_budget"])
+        search_results_per_call = int(profile_cfg["search_results_per_call"])
+        search_used = 0
+        tool_round = 0
+
+        while tool_round < max_tool_rounds:
             self._inject_task_memory_snapshot(messages)
             response = self._call_llm_with_tools(
                 messages,
@@ -1358,6 +1972,7 @@ class TreeholeRAGAgent:
             if not tool_calls:
                 break
 
+            tool_round += 1
             messages.append(
                 self._build_assistant_message(
                     content=response.get("content"),
@@ -1366,503 +1981,626 @@ class TreeholeRAGAgent:
                 )
             )
 
+            batch_new_posts: List[Dict[str, Any]] = []
             for tool_call in tool_calls:
                 name = tool_call["function"]["name"]
-                args = json.loads(tool_call["function"].get("arguments", "{}") or "{}")
+                try:
+                    args = json.loads(tool_call["function"].get("arguments", "{}") or "{}")
+                except Exception:
+                    args = {}
 
                 if name == "search_treehole":
-                    search_count += 1
-                    phase_used += 1
-                    keyword = args.get("keyword", "")
-                    reason = args.get("reason", "")
+                    if search_used >= search_budget:
+                        result_summary = "search_treehole 预算已用尽，请改用已有帖子继续分析，或直接准备总结。"
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call["id"],
+                                "name": "search_treehole",
+                                "content": result_summary,
+                            }
+                        )
+                        continue
 
-                    search_history.append({
-                        "iteration": search_count,
-                        "phase": phase_name,
-                        "action": "search",
-                        "keyword": keyword,
-                        "reason": reason,
-                    })
-
+                    keyword = str(args.get("keyword", "") or "").strip()
+                    reason = str(args.get("reason", "") or "").strip()
+                    search_used += 1
+                    self._conversation_search_count += 1
+                    iteration = self._conversation_search_count
+                    search_history.append(
+                        {
+                            "iteration": iteration,
+                            "mode": profile,
+                            "action": "search",
+                            "keyword": keyword,
+                            "reason": reason,
+                        }
+                    )
                     self._append_task_memory(
-                        f"- [{phase_name}] search#{search_count}: keyword={keyword} reason={reason or '-'}"
+                        f"- [{profile}] search#{iteration}: keyword={keyword or '-'} reason={reason or '-'}"
                     )
 
-                    temp_callback = self.info_callback
-                    self.info_callback = None
-                    posts = self.search_treehole(keyword, max_results=MAX_SEARCH_RESULTS)
-                    self._upsert_posts(all_searched_posts, posts)
-                    if phase_posts is not None:
-                        self._upsert_posts(phase_posts, posts)
-                    self.info_callback = temp_callback
-
-                    search_msg = f"[{phase_name}] 第{search_count}次搜索 关键词: {keyword}"
-                    if reason:
-                        search_msg += f"\n搜索原因: {reason}"
-                    search_msg += f"\n✓ 找到 {len(posts)} 个帖子"
-                    print(f"\n{AGENT_PREFIX}{search_msg}")
-                    if self.info_callback:
-                        self.info_callback(search_msg)
+                    posts = self.search_treehole(keyword, max_results=search_results_per_call)
+                    self._upsert_posts(working_posts, posts)
+                    self._upsert_session_posts(posts)
+                    batch_new_posts.extend(posts)
 
                     if posts:
-                        include_preview = (phase_name.startswith("阶段A") and not broad_preview_used)
-                        brief = self._format_search_brief(
-                            posts,
-                            max_items=min(15, MAX_CONTEXT_POSTS),
-                            include_comment_preview=include_preview,
-                            preview_comments_per_post=3,
-                        )
-                        if include_preview:
-                            broad_preview_used = True
-                            self._append_task_memory("- 阶段A首次搜索已展示每帖最多3条评论预览（来自search响应）")
-                            result_summary = (
-                                f"搜索到 {len(posts)} 个帖子。轻量摘要（含一次评论预览）如下：\n{brief}"
+                        result_summary = (
+                            f"搜索到 {len(posts)} 个帖子。以下是带评论预览的轻量摘要：\n"
+                            + self._format_search_brief(
+                                posts,
+                                max_items=min(12, profile_cfg["context_post_limit"]),
+                                include_comment_preview=True,
+                                preview_comments_per_post=3,
                             )
-                        else:
-                            result_summary = f"搜索到 {len(posts)} 个帖子。轻量摘要如下：\n{brief}"
+                        )
                     else:
                         result_summary = f"未找到关于「{keyword}」的相关帖子。"
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "name": "search_treehole",
-                        "content": result_summary,
-                    })
-
-                    self._human_delay(0.2, 0.8, "工具调用间隔")
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": "search_treehole",
+                            "content": result_summary,
+                        }
+                    )
 
                 elif name == "get_post_by_pid":
                     pid = int(args.get("pid", 0) or 0)
-                    include_comments = bool(args.get("include_comments", False))
-                    max_comments = int(args.get("max_comments", MAX_COMMENTS_PER_POST) or MAX_COMMENTS_PER_POST)
-                    reason = args.get("reason", "")
-
-                    search_history.append({
-                        "iteration": search_count,
-                        "phase": phase_name,
-                        "action": "get_post",
-                        "pid": pid,
-                        "reason": reason,
-                    })
-                    self._append_task_memory(
-                        f"- [{phase_name}] get_post: pid={pid} include_comments={include_comments} max_comments={max_comments}"
+                    include_comments = bool(args.get("include_comments", True))
+                    max_comments = int(args.get("max_comments", profile_cfg["comment_limit"]) or profile_cfg["comment_limit"])
+                    reason = str(args.get("reason", "") or "").strip()
+                    search_history.append(
+                        {
+                            "iteration": self._conversation_search_count,
+                            "mode": profile,
+                            "action": "get_post",
+                            "pid": pid,
+                            "reason": reason,
+                        }
                     )
-
+                    self._append_task_memory(
+                        f"- [{profile}] get_post: pid={pid} include_comments={include_comments} max_comments={max_comments}"
+                    )
                     post = self.get_post_by_pid(pid, include_comments=include_comments, max_comments=max_comments)
                     if post:
-                        self._upsert_posts(all_searched_posts, [post])
-                        if phase_posts is not None:
-                            self._upsert_posts(phase_posts, [post])
-                        post_text = format_posts_batch(
-                            [post],
-                            include_comments=True,
-                            max_comments=max_comments if include_comments else 0,
-                        )
-                        result_summary = f"已获取帖子 #{pid}：\n\n{post_text}"
+                        self._upsert_posts(working_posts, [post])
+                        self._upsert_session_posts([post])
+                        batch_new_posts.append(post)
+                        result_summary = f"已获取帖子 #{pid}：\n\n{format_post_to_text(post, include_comments=include_comments, max_comments=max_comments)}"
                     else:
                         result_summary = f"未能获取帖子 #{pid}。"
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "name": "get_post_by_pid",
-                        "content": result_summary,
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": "get_post_by_pid",
+                            "content": result_summary,
+                        }
+                    )
 
                 elif name == "get_comments_by_pid":
                     pid = int(args.get("pid", 0) or 0)
-                    max_comments = int(args.get("max_comments", MAX_COMMENTS_PER_POST) or MAX_COMMENTS_PER_POST)
+                    max_comments = int(args.get("max_comments", profile_cfg["comment_limit"]) or profile_cfg["comment_limit"])
                     sort = str(args.get("sort", "asc") or "asc").lower()
-                    reason = args.get("reason", "")
-
-                    search_history.append({
-                        "iteration": search_count,
-                        "phase": phase_name,
-                        "action": "get_comment",
-                        "pid": pid,
-                        "max_comments": max_comments,
-                        "reason": reason,
-                    })
-                    self._append_task_memory(
-                        f"- [{phase_name}] get_comment: pid={pid} max_comments={max_comments} sort={sort}"
+                    reason = str(args.get("reason", "") or "").strip()
+                    search_history.append(
+                        {
+                            "iteration": self._conversation_search_count,
+                            "mode": profile,
+                            "action": "get_comment",
+                            "pid": pid,
+                            "max_comments": max_comments,
+                            "reason": reason,
+                        }
                     )
-
+                    self._append_task_memory(
+                        f"- [{profile}] get_comment: pid={pid} max_comments={max_comments} sort={sort}"
+                    )
                     comments = self.get_comments_by_pid(pid, max_comments=max_comments, sort=sort)
 
-                    # Merge comments into post cache if post already exists in working set.
-                    for post in all_searched_posts:
-                        if post.get("pid") == pid:
+                    for post in working_posts:
+                        if int(post.get("pid", 0) or 0) == pid:
                             post["comments"] = comments
                             break
+                    if pid in self._session_posts:
+                        self._session_posts[pid]["comments"] = comments
 
                     preview_lines = []
-                    for i, c in enumerate(comments[:10], 1):
-                        ctext = self._compact_text_preview(c.get("text", ""), max_len=80)
-                        preview_lines.append(f"{i}. {ctext}")
-                    preview = "\n".join(preview_lines) if preview_lines else "无评论或拉取失败"
+                    for idx, comment in enumerate(comments[:10], 1):
+                        preview_lines.append(
+                            f"{idx}. {self._compact_text_preview(comment.get('text', ''), max_len=80)}"
+                        )
                     result_summary = (
-                        f"已获取帖子 #{pid} 评论，共 {len(comments)} 条（展示前10条）：\n{preview}"
+                        f"已获取帖子 #{pid} 评论，共 {len(comments)} 条（展示前10条）：\n"
+                        + ("\n".join(preview_lines) if preview_lines else "无评论或拉取失败")
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": "get_comments_by_pid",
+                            "content": result_summary,
+                        }
                     )
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "name": "get_comments_by_pid",
-                        "content": result_summary,
-                    })
+            if batch_new_posts:
+                self._emit_info(
+                    f"本轮工具调用后新增/更新 {len({p.get('pid') for p in batch_new_posts if p.get('pid')})} 帖，当前会话累计 {len(self._session_posts)} 帖"
+                )
+                self._save_session()
 
-            if phase_used >= phase_max:
-                break
+        if search_used >= search_budget:
+            self._emit_info(f"{self.MODE_PROFILES[profile]['label']} 搜索预算已用满。")
 
-        return search_count
+    def _run_profiled_turn(self, user_question: str, profile: str) -> Dict[str, Any]:
+        profile_cfg = self.MODE_PROFILES[profile]
+        self._ensure_session_for_mode(profile, user_question)
+        self._append_task_memory(f"- user_turn[{profile}]: {user_question}")
+        self._append_session_turn("user", user_question, mode=profile)
 
-    # ------------------------------------------------------------------ #
-    #              Mode 2: Auto search (single-shot, legacy)              #
-    # ------------------------------------------------------------------ #
+        messages = self._build_turn_messages(user_question, profile)
+        working_posts = self._rank_posts_for_query(
+            list(self._session_posts.values()),
+            query=user_question,
+            limit=max(profile_cfg["context_post_limit"], 20),
+        )
+        search_history: List[Dict[str, Any]] = []
 
-    def mode_auto_search(self, user_question: str) -> Dict[str, Any]:
-        """Mode 2 (single-shot): Automatic keyword extraction with iterative search."""
-        print_header("模式 2: 智能自动检索（支持多轮搜索）")
-
-        self._start_task_memory(user_question, mode="auto_single")
-        self._append_task_memory("- strategy: 阶段A宽泛探索 + 阶段B高质量聚焦")
-
-        messages = [
-            {
-                "role": "system",
-                "content": self._build_auto_search_system_prompt(),
-            },
-            {"role": "user", "content": f"用户问题：{user_question}"},
-        ]
-
-        all_searched_posts: List[Dict[str, Any]] = []
-        stage_b_posts: List[Dict[str, Any]] = []
-        search_history: List[Dict] = []
-
-        msg = "✓ LLM 开始分析问题..."
-        print(f"{AGENT_PREFIX}{msg}")
-        if self.info_callback:
-            self.info_callback(msg)
-
-        messages.append({
-            "role": "user",
-            "content": (
-                f"请执行阶段A（宽泛探索）：建议 {BROAD_SEARCH_MIN}-{BROAD_SEARCH_MAX} 次。"
-                "重点识别院系/老师/课程/等的黑话、简称、别称；若信息已收敛可提前结束。"
-            ),
-        })
-        search_count = self._execute_search_loop(
-            messages,
-            all_searched_posts,
-            search_history,
-            0,
-            phase_max=BROAD_SEARCH_MAX,
-            phase_name="阶段A-宽泛探索",
-            phase_posts=None,
+        self._emit_info(f"进入 {profile_cfg['label']} 模式，开始检索...")
+        self._execute_research_loop(
+            messages=messages,
+            working_posts=working_posts,
+            search_history=search_history,
+            user_question=user_question,
+            profile=profile,
         )
 
-        messages.append({
-            "role": "user",
-            "content": (
-                f"请执行阶段B（高质量聚焦）：建议 {FOCUSED_SEARCH_MIN}-{FOCUSED_SEARCH_MAX} 次。"
-                "优先筛选高 reply / 高 star 的帖子，再补充时间与内容质量；若证据已充分可提前结束。"
-            ),
-        })
-        search_count = self._execute_search_loop(
-            messages,
-            all_searched_posts,
-            search_history,
-            search_count,
-            phase_max=FOCUSED_SEARCH_MAX,
-            phase_name="阶段B-高质量聚焦",
-            phase_posts=stage_b_posts,
+        candidate_posts = self._rank_posts_for_query(
+            list(self._session_posts.values()),
+            query=user_question,
+            limit=max(profile_cfg["context_post_limit"] * 2, 24),
         )
-
-        unique_posts = list({p.get("pid"): p for p in all_searched_posts if p.get("pid") is not None}.values())
-        stage_b_unique_posts = list({p.get("pid"): p for p in stage_b_posts if p.get("pid") is not None}.values())
-        final_candidates = stage_b_unique_posts if stage_b_unique_posts else unique_posts
-
-        msg = (
-            f"✓ 累计找到 {len(unique_posts)} 个不重复帖子，"
-            f"阶段B候选 {len(stage_b_unique_posts)} 个，正在生成回答..."
-        )
-        print(f"\n{AGENT_PREFIX}{msg}")
-        if self.info_callback:
-            self.info_callback(msg)
-
         final_context_posts = self._hydrate_posts_for_context(
-            final_candidates,
-            MAX_COMMENTS_PER_POST,
+            candidate_posts,
+            profile_cfg["comment_limit"],
             selection_query=user_question,
-            context_post_limit=MAX_CONTEXT_POSTS,
+            context_post_limit=profile_cfg["context_post_limit"],
+            selected_limit=profile_cfg["comment_fetch_posts"],
         )
         final_context_text = format_posts_batch(
             final_context_posts,
             include_comments=True,
-            max_comments=MAX_COMMENTS_PER_POST,
+            max_comments=profile_cfg["comment_limit"],
+        )
+        self._append_task_memory(
+            f"- final_context[{profile}]: posts={len(final_context_posts)} total_session_posts={len(self._session_posts)}"
         )
 
-        self._append_task_memory(
-            (
-                f"- final_context_posts={len(final_context_posts)} "
-                f"(stage_b_candidates={len(stage_b_unique_posts)}, total_unique={len(unique_posts)})"
-            )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"以下是当前问题的最终上下文（共 {len(final_context_posts)} 帖，已补关键评论）：\n\n"
+                    f"{final_context_text}"
+                ),
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": "请基于以上已检索内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造；如果证据不足请明确说明。",
+            }
         )
 
         print_separator("-")
-        print("\n【最终回答】\n")
-
-        messages.append({
-            "role": "user",
-            "content": (
-                f"以下是最终高质量上下文（共 {len(final_context_posts)} 帖，已按策略补充关键评论）：\n\n"
-                f"{final_context_text}"
-            ),
-        })
-
-        messages.append({
-            "role": "user",
-            "content": "好的，你已经完成了所有搜索。请现在基于你已经检索到的所有树洞内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造信息；如果信息不足请诚实说明。",
-        })
+        print(f"\n【{profile_cfg['label']} 回答】\n")
         response = self._call_llm_with_tools(messages, tools=[], stream=True)
         final_answer = response.get("content") or ""
-
         print("\n")
         print_separator("-")
 
+        self._append_session_turn(
+            "assistant",
+            final_answer,
+            mode=profile,
+            search_history=search_history,
+            source_pids=[post.get("pid") for post in final_context_posts[:20]],
+        )
+        self._save_session()
+
         return {
             "answer": final_answer,
-            "search_count": search_count,
-            "search_history": search_history,
-            "keywords": [],
-            "sources": [{"pid": p.get("pid"), "text": p.get("text", "")[:100] + "..."} for p in final_candidates[:20]],
-            "num_sources": len(final_candidates),
-        }
-
-    # ------------------------------------------------------------------ #
-    #           Mode 2 Multi-turn: persistent conversation                #
-    # ------------------------------------------------------------------ #
-
-    def save_conversation(self):
-        """Save conversation history to disk."""
-        data = {
-            "history": self._conversation_history,
             "search_count": self._conversation_search_count,
+            "search_history": search_history,
+            "sources": self._summarize_source_refs(final_context_posts),
+            "num_sources": len(final_context_posts),
+            "conversation_turns": sum(1 for turn in self._session_turns if turn.get("role") == "user"),
+            "session_id": self._active_session_id,
+            "mode": profile,
         }
-        os.makedirs(os.path.dirname(CONVERSATION_FILE), exist_ok=True)
-        with open(CONVERSATION_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"{AGENT_PREFIX}✓ 对话已保存到 {CONVERSATION_FILE}")
 
-    def load_conversation(self) -> bool:
-        """Load conversation history from disk. Returns True if loaded."""
-        if not os.path.exists(CONVERSATION_FILE):
-            return False
-        try:
-            with open(CONVERSATION_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self._conversation_history = data.get("history", [])
-            self._conversation_search_count = data.get("search_count", 0)
-            turns = sum(1 for m in self._conversation_history if m["role"] == "user") // 2
-            print(f"{AGENT_PREFIX}✓ 已恢复上次对话（{turns} 轮，{self._conversation_search_count} 次搜索）")
-            return True
-        except Exception as e:
-            print(f"{AGENT_PREFIX}加载对话记录失败: {e}")
-            return False
+    def _load_latest_pid_state(self) -> int:
+        payload = load_json(LATEST_PID_STATE_FILE) or {}
+        pid = int(payload.get("latest_pid") or 0)
+        if pid > 0:
+            return pid
+        session_max = max((int(pid) for pid in self._session_posts.keys()), default=0)
+        return max(session_max, RECENT_PID_SCAN_HINT)
 
-    def reset_conversation(self):
-        """Reset conversation state. Archive old record if exists."""
-        self._conversation_history.clear()
-        self._conversation_searched_posts.clear()
-        self._conversation_search_count = 0
-        self._task_memory_file = None
-        if os.path.exists(CONVERSATION_FILE):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            archive_path = CONVERSATION_FILE.replace(".json", f"_{ts}.json")
-            os.rename(CONVERSATION_FILE, archive_path)
-            print(f"{AGENT_PREFIX}✓ 旧对话已归档: {archive_path}")
-        print(f"{AGENT_PREFIX}✓ 对话已重置")
+    def _save_latest_pid_state(self, latest_pid: int) -> None:
+        if latest_pid <= 0:
+            return
+        save_json(
+            {
+                "latest_pid": latest_pid,
+                "updated_at": self._now_str(),
+            },
+            LATEST_PID_STATE_FILE,
+        )
+
+    def _discover_latest_pid(self) -> int:
+        seed_pid = self._load_latest_pid_state()
+        step = max(20, RECENT_PID_SCAN_STEP)
+        best_pid = 0
+        pid = seed_pid
+        probes = 0
+        consecutive_misses = 0
+        self._emit_info(f"开始探测最新 PID，起点 {seed_pid}")
+
+        while probes < RECENT_PID_SCAN_MAX_PROBES:
+            post = self.get_post_by_pid(pid, include_comments=False)
+            probes += 1
+            if post:
+                best_pid = max(best_pid, pid)
+                consecutive_misses = 0
+                pid += step
+            else:
+                consecutive_misses += 1
+                pid += step
+                if best_pid and consecutive_misses >= 3:
+                    break
+
+        if not best_pid:
+            best_pid = seed_pid
+
+        upper_bound = best_pid + step
+        for candidate_pid in range(best_pid, upper_bound + 1):
+            post = self.get_post_by_pid(candidate_pid, include_comments=False)
+            if post:
+                best_pid = max(best_pid, candidate_pid)
+
+        self._save_latest_pid_state(best_pid)
+        self._emit_info(f"最新有效 PID 估计为 {best_pid}")
+        return best_pid
+
+    def _collect_recent_posts_by_pid(self, count: int, latest_pid: Optional[int] = None) -> List[Dict[str, Any]]:
+        latest_pid = latest_pid or self._discover_latest_pid()
+        posts: List[Dict[str, Any]] = []
+        pid = latest_pid
+        attempts = 0
+        max_attempts = max(count * 6, count + 50)
+        while pid > 0 and len(posts) < count and attempts < max_attempts:
+            post = self.get_post_by_pid(pid, include_comments=False)
+            attempts += 1
+            if post:
+                posts.append(post)
+            pid -= 1
+        self._emit_info(f"最近 PID 扫描完成: 命中 {len(posts)} 帖, latest_pid={latest_pid}")
+        return posts
+
+    @staticmethod
+    def _score_daily_post(post: Dict[str, Any]) -> float:
+        reply_count = max(0, int(post.get("reply_count", post.get("reply", 0)) or 0))
+        star_count = max(0, int(post.get("star_count", post.get("likenum", 0)) or 0))
+        comment_total = max(0, int(post.get("comment_total", 0) or 0))
+        pid_bonus = int(post.get("pid", 0) or 0) / 1_000_000.0
+        return reply_count * 1.0 + star_count * 1.6 + comment_total * 0.35 + pid_bonus
+
+    def mode_daily_hot_digest(self, recent_post_count: int = DAILY_DIGEST_RECENT_POSTS) -> Dict[str, Any]:
+        print_header("模式 1: 每日神帖汇总")
+        latest_pid = self._discover_latest_pid()
+        recent_posts = self._collect_recent_posts_by_pid(recent_post_count, latest_pid=latest_pid)
+        ranked_posts = sorted(recent_posts, key=self._score_daily_post, reverse=True)
+        top_posts = ranked_posts[:max(DAILY_DIGEST_TOP_POSTS, 1)]
+        hydrated_posts = self._hydrate_posts_for_context(
+            top_posts,
+            max_comments=min(MAX_COMMENTS_PER_POST if MAX_COMMENTS_PER_POST > 0 else 10, 10) if MAX_COMMENTS_PER_POST != -1 else 10,
+            selection_query="每日神帖 热门 热度 质量 高回复 高收藏",
+            context_post_limit=len(top_posts),
+            selected_limit=len(top_posts),
+        )
+
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(DAILY_DIGEST_DIR, run_id)
+        os.makedirs(run_dir, exist_ok=True)
+        raw_json_path = os.path.join(run_dir, "daily_hot_posts.json")
+        raw_md_path = os.path.join(run_dir, "daily_hot_posts.md")
+        save_json(hydrated_posts, raw_json_path)
+        self._save_text_artifact(
+            raw_md_path,
+            format_posts_batch(hydrated_posts, include_comments=True, max_comments=10),
+        )
+
+        system_message = (
+            "你是北大树洞日报助手。请根据给定的近期帖子，产出一份“每日神帖汇总”。"
+            "优先说明为什么这些帖子热、为什么值得看，并明确引用 pid。"
+        )
+        user_message = (
+            f"最近抓取的帖子来自最新 PID 附近，共筛出 {len(hydrated_posts)} 帖高热候选。\n"
+            f"请输出一份简洁但信息充分的中文日报。\n\n"
+            f"{format_posts_batch(hydrated_posts, include_comments=True, max_comments=10)}"
+        )
+
+        print("\n【每日神帖汇总】\n")
+        answer = self.call_llm(user_message=user_message, system_message=system_message, stream=True)
+        print("\n")
+        print_separator("-")
+
+        answer_path = os.path.join(run_dir, "daily_hot_digest.md")
+        self._save_text_artifact(answer_path, answer)
+        return {
+            "answer": answer,
+            "search_count": self._conversation_search_count,
+            "search_history": [],
+            "sources": self._summarize_source_refs(hydrated_posts),
+            "num_sources": len(hydrated_posts),
+            "artifacts": {
+                "json": raw_json_path,
+                "markdown": raw_md_path,
+                "digest": answer_path,
+            },
+        }
+
+    def mode_thorough_search(
+        self,
+        keywords: List[str],
+        question: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        print_header("模式 4: Thorough Search")
+        unique_keywords = []
+        seen_keywords: Set[str] = set()
+        for keyword in keywords:
+            cleaned = str(keyword or "").strip()
+            if cleaned and cleaned not in seen_keywords:
+                seen_keywords.add(cleaned)
+                unique_keywords.append(cleaned)
+        if not unique_keywords:
+            raise ValueError("thorough search 至少需要一个关键词")
+
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_slug = self._slug_from_text("_".join(unique_keywords), max_len=32)
+        run_dir = os.path.join(THOROUGH_SEARCH_DIR, f"{run_id}_{run_slug}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        merged_posts: Dict[int, Dict[str, Any]] = {}
+        search_history = []
+        for keyword in unique_keywords:
+            posts = self.search_treehole_exhaustive(keyword)
+            search_history.append({"action": "search_all", "keyword": keyword, "count": len(posts)})
+            for post in posts:
+                pid = int(post.get("pid", 0) or 0)
+                if pid:
+                    merged_posts[pid] = post
+
+        all_posts = sorted(merged_posts.values(), key=lambda item: int(item.get("pid", 0) or 0), reverse=True)
+        hydrated_posts = self._hydrate_all_posts_with_comments(all_posts, max_comments=-1)
+
+        corpus_json_path = os.path.join(run_dir, "corpus.json")
+        corpus_md_path = os.path.join(run_dir, "corpus.md")
+        corpus_index_path = os.path.join(run_dir, "corpus_index.md")
+        save_json(hydrated_posts, corpus_json_path)
+        self._save_text_artifact(corpus_md_path, format_posts_batch(hydrated_posts, include_comments=True, max_comments=-1))
+        self._save_text_artifact(
+            corpus_index_path,
+            self._format_search_brief(
+                hydrated_posts,
+                max_items=len(hydrated_posts),
+                include_comment_preview=True,
+                preview_comments_per_post=2,
+            ),
+        )
+
+        answer = ""
+        answer_path = os.path.join(run_dir, "answer.md")
+        if question:
+            selected_posts = self._rank_posts_for_query(
+                hydrated_posts,
+                query=question,
+                limit=max(THOROUGH_SEARCH_MAX_CONTEXT_POSTS, 20),
+            )
+            context_posts = self._hydrate_posts_for_context(
+                selected_posts,
+                min(MAX_COMMENTS_PER_POST if MAX_COMMENTS_PER_POST > 0 else 12, 12) if MAX_COMMENTS_PER_POST != -1 else 12,
+                selection_query=question,
+                context_post_limit=THOROUGH_SEARCH_MAX_CONTEXT_POSTS,
+                selected_limit=min(len(selected_posts), max(MAX_COMMENT_FETCH_POSTS, 12)),
+            )
+            system_message = (
+                "你是北大树洞语料问答助手。你正在使用用户手工指定关键词抓下来的完整语料回答问题。"
+                "请优先引用 pid，并对证据不足处明确说明。"
+            )
+            user_message = (
+                f"关键词: {', '.join(unique_keywords)}\n"
+                f"问题: {question}\n\n"
+                f"以下是从大语料中筛出的高相关上下文：\n\n"
+                f"{format_posts_batch(context_posts, include_comments=True, max_comments=12)}"
+            )
+            print("\n【Thorough Search 回答】\n")
+            answer = self.call_llm(user_message=user_message, system_message=system_message, stream=True)
+            print("\n")
+            self._save_text_artifact(answer_path, answer)
+
+        return {
+            "answer": answer,
+            "search_count": self._conversation_search_count,
+            "search_history": search_history,
+            "sources": self._summarize_source_refs(hydrated_posts),
+            "num_sources": len(hydrated_posts),
+            "artifacts": {
+                "json": corpus_json_path,
+                "markdown": corpus_md_path,
+                "index": corpus_index_path,
+                "answer": answer_path if answer else None,
+            },
+        }
+
+    # ------------------------------------------------------------------ #
+    #              Public modes / backward-compatible wrappers            #
+    # ------------------------------------------------------------------ #
+
+    def mode_quick_qa(self, user_question: str) -> Dict[str, Any]:
+        print_header("模式 2: 日常 Q&A")
+        return self._run_profiled_turn(user_question, profile="quick")
+
+    def mode_deep_research(self, user_question: str) -> Dict[str, Any]:
+        print_header("模式 3: Deep Research")
+        return self._run_profiled_turn(user_question, profile="deep")
+
+    def mode_auto_search(self, user_question: str) -> Dict[str, Any]:
+        """Backward-compatible entrypoint."""
+        return self.mode_deep_research(user_question)
 
     def mode_auto_search_multi_turn(self, user_question: str) -> Dict[str, Any]:
-        """Mode 2 Multi-turn: auto search with persistent conversation history.
+        """Backward-compatible multi-turn entrypoint."""
+        return self.mode_quick_qa(user_question)
 
-        Each call appends the new user question to the existing conversation,
-        allowing follow-up questions that leverage previously retrieved context.
-        Call ``reset_conversation()`` to start fresh.
-        """
-        # Lazy-init system message on first turn
-        if not self._conversation_history:
-            print_header("模式 2: 智能自动检索（多轮对话）")
-            self._start_task_memory(user_question, mode="auto_multi")
-            self._conversation_history.append({
-                "role": "system",
-                "content": self._build_auto_search_system_prompt(),
-            })
-        else:
-            print_separator("-")
-            print(f"\n{AGENT_PREFIX}继续多轮对话（已有 {self._conversation_search_count} 次搜索记录）\n")
-            if not self._task_memory_file:
-                self._start_task_memory(user_question, mode="auto_multi_resume")
+    def save_conversation(self):
+        """Save current session to disk."""
+        self._save_session()
+        if self._active_session_id:
+            self._emit_info(f"会话已保存: {self._active_session_id}")
 
-        self._append_task_memory(f"- user_turn: {user_question}")
-
-        # Inject latest task memory snapshot for this turn.
-        self._conversation_history.append({
-            "role": "system",
-            "content": self._build_auto_search_system_prompt(),
-        })
-
-        # Append user message
-        self._conversation_history.append({"role": "user", "content": user_question})
-
-        search_history_this_turn: List[Dict] = []
-        stage_b_posts_this_turn: List[Dict[str, Any]] = []
-
-        msg = "✓ LLM 分析中..."
-        print(f"{AGENT_PREFIX}{msg}")
-        if self.info_callback:
-            self.info_callback(msg)
-
-        self._conversation_history.append({
-            "role": "user",
-            "content": (
-                f"请执行阶段A（宽泛探索）：建议 {BROAD_SEARCH_MIN}-{BROAD_SEARCH_MAX} 次。"
-                "目标是识别黑话/简称/别称，并扩大关键词覆盖；若信息已收敛可提前结束。"
-            ),
-        })
-        self._conversation_search_count = self._execute_search_loop(
-            self._conversation_history,
-            self._conversation_searched_posts,
-            search_history_this_turn,
-            self._conversation_search_count,
-            phase_max=BROAD_SEARCH_MAX,
-            phase_name="阶段A-宽泛探索",
-            phase_posts=None,
-        )
-
-        self._conversation_history.append({
-            "role": "user",
-            "content": (
-                f"请执行阶段B（高质量聚焦）：建议 {FOCUSED_SEARCH_MIN}-{FOCUSED_SEARCH_MAX} 次。"
-                "优先抓取高 reply / 高 star 的帖子，必要时用 get_post_by_pid 精确补洞；证据充分可提前结束。"
-            ),
-        })
-        self._conversation_search_count = self._execute_search_loop(
-            self._conversation_history,
-            self._conversation_searched_posts,
-            search_history_this_turn,
-            self._conversation_search_count,
-            phase_max=FOCUSED_SEARCH_MAX,
-            phase_name="阶段B-高质量聚焦",
-            phase_posts=stage_b_posts_this_turn,
-        )
-
-        unique_posts = list({p.get("pid"): p for p in self._conversation_searched_posts if p.get("pid") is not None}.values())
-        stage_b_unique_posts = list({p.get("pid"): p for p in stage_b_posts_this_turn if p.get("pid") is not None}.values())
-        final_candidates = stage_b_unique_posts if stage_b_unique_posts else unique_posts
-
-        if search_history_this_turn:
-            msg = (
-                f"✓ 本轮搜索 {len(search_history_this_turn)} 次，累计 {len(unique_posts)} 个不重复帖子，"
-                f"阶段B候选 {len(stage_b_unique_posts)} 个"
+    def load_conversation(self) -> bool:
+        """Load the active or latest session from disk."""
+        ok = self._load_latest_session()
+        if ok:
+            turns = sum(1 for turn in self._session_turns if turn.get("role") == "user")
+            self._emit_info(
+                f"已恢复会话: {self._active_session_id}（{turns} 轮，{self._conversation_search_count} 次搜索）"
             )
-            print(f"\n{AGENT_PREFIX}{msg}")
-            if self.info_callback:
-                self.info_callback(msg)
+        return ok
 
-        final_context_posts = self._hydrate_posts_for_context(
-            final_candidates,
-            MAX_COMMENTS_PER_POST,
-            selection_query=user_question,
-            context_post_limit=MAX_CONTEXT_POSTS,
-        )
-        final_context_text = format_posts_batch(
-            final_context_posts,
-            include_comments=True,
-            max_comments=MAX_COMMENTS_PER_POST,
-        )
+    def reset_conversation(self):
+        """Start a fresh quick-QA session."""
+        self._save_session()
+        self._begin_new_session("新会话", self._default_cli_mode)
 
-        self._append_task_memory(
-            (
-                f"- turn_final_context_posts={len(final_context_posts)} "
-                f"(stage_b_candidates={len(stage_b_unique_posts)}, total_unique={len(unique_posts)})"
+    def _handle_cli_command(self, user_input: str) -> bool:
+        command = user_input.strip()
+        if not command.startswith("/"):
+            return False
+
+        if command in {"/help", "/?"}:
+            print(
+                "\n可用命令:\n"
+                "/mode quick|deep      切换默认输入模式\n"
+                "/daily [N]            生成每日神帖汇总\n"
+                "/thorough kw1,kw2 | 问题   做 thorough search 并回答\n"
+                "/sessions             查看历史会话列表\n"
+                "/resume <session_id>  恢复指定会话\n"
+                "/history [session_id] 查看当前/指定会话内容\n"
+                "/new 或 /reset        新建会话\n"
+                "/save                 保存当前会话\n"
+                "/quit                 保存并退出\n"
             )
-        )
+            return True
 
-        # Ask LLM for final answer
-        print_separator("-")
-        print("\n【回答】\n")
+        if command.startswith("/mode "):
+            mode = command.split(maxsplit=1)[1].strip().lower()
+            if mode not in self.MODE_PROFILES:
+                self._emit_info(f"未知模式: {mode}")
+                return True
+            self._default_cli_mode = mode
+            self._emit_info(f"默认模式已切换为 {self.MODE_PROFILES[mode]['label']}")
+            return True
 
-        self._conversation_history.append({
-            "role": "user",
-            "content": (
-                f"以下是本轮最终高质量上下文（共 {len(final_context_posts)} 帖，已按策略补充关键评论）：\n\n"
-                f"{final_context_text}"
-            ),
-        })
+        if command.startswith("/daily"):
+            parts = command.split()
+            count = DAILY_DIGEST_RECENT_POSTS
+            if len(parts) > 1 and parts[1].isdigit():
+                count = int(parts[1])
+            self.mode_daily_hot_digest(recent_post_count=count)
+            return True
 
-        self._conversation_history.append({
-            "role": "user",
-            "content": "请基于你已经检索到的所有树洞内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造信息；如果信息不足请诚实说明。",
-        })
+        if command.startswith("/thorough "):
+            payload = command[len("/thorough "):].strip()
+            keywords_part, _, question_part = payload.partition("|")
+            keywords = [item.strip() for item in keywords_part.split(",") if item.strip()]
+            question = question_part.strip() or None
+            self.mode_thorough_search(keywords=keywords, question=question)
+            return True
 
-        response = self._call_llm_with_tools(self._conversation_history, tools=[], stream=True)
-        final_answer = response.get("content") or ""
+        if command == "/sessions":
+            print("\n" + self.render_session_list() + "\n")
+            return True
 
-        # Save assistant reply to history for next turn
-        self._conversation_history.append(
-            self._build_assistant_message(
-                content=final_answer,
-                reasoning_content=response.get("reasoning_content"),
-            )
-        )
+        if command.startswith("/resume "):
+            session_id = command.split(maxsplit=1)[1].strip()
+            if self._load_session_by_id(session_id):
+                self._emit_info(f"已恢复会话: {session_id}")
+            else:
+                self._emit_info(f"未找到会话: {session_id}")
+            return True
 
-        print("\n")
-        print_separator("-")
+        if command.startswith("/history"):
+            parts = command.split(maxsplit=1)
+            session_id = parts[1].strip() if len(parts) > 1 else None
+            print("\n" + self.render_session_history(session_id=session_id) + "\n")
+            return True
 
-        return {
-            "answer": final_answer,
-            "search_count": self._conversation_search_count,
-            "search_history": search_history_this_turn,
-            "sources": [{"pid": p.get("pid"), "text": p.get("text", "")[:100] + "..."} for p in final_candidates[:20]],
-            "num_sources": len(final_candidates),
-            "conversation_turns": sum(1 for m in self._conversation_history if m["role"] == "user") // 2,
-        }
+        if command in {"/new", "/reset"}:
+            self.reset_conversation()
+            return True
+
+        if command == "/save":
+            self.save_conversation()
+            return True
+
+        if command == "/quit":
+            self.save_conversation()
+            self._emit_info("退出多轮对话")
+            raise KeyboardInterrupt
+
+        return False
 
     # ------------------------------------------------------------------ #
     #                      Interactive CLI                                #
     # ------------------------------------------------------------------ #
 
     def interactive_mode(self):
-        """Interactive mode for mode 2 multi-turn conversation only."""
-        print_header("PKU Treehole RAG Agent - Mode 2 Interactive")
+        """Interactive mode with mode switching and session history."""
+        print_header("PKU Treehole RAG Agent")
 
-        if self.load_conversation():
-            resume = input("检测到上次对话记录，是否继续？(Y/n): ").strip().lower()
-            if resume not in ('y', ''):
-                self.reset_conversation()
-        else:
-            self.reset_conversation()
+        if not self.load_conversation():
+            self._begin_new_session("启动会话", self._default_cli_mode)
 
-        print(f"\n{AGENT_PREFIX}模式2多轮对话（/reset 重置, /save 存档, /quit 退出）\n")
+        print(
+            f"\n{AGENT_PREFIX}默认模式: {self.MODE_PROFILES[self._default_cli_mode]['label']}\n"
+            f"{AGENT_PREFIX}输入 /help 查看命令，直接提问会走默认模式。\n"
+        )
 
         while True:
-            user_question = input("\n你: ").strip()
+            try:
+                user_question = input("\n你: ").strip()
+            except EOFError:
+                self.save_conversation()
+                break
             if not user_question:
                 continue
-            if user_question == "/quit":
-                self.save_conversation()
-                print(f"{AGENT_PREFIX}退出多轮对话")
+            try:
+                if self._handle_cli_command(user_question):
+                    continue
+            except KeyboardInterrupt:
                 break
-            if user_question == "/reset":
-                self.reset_conversation()
-                continue
-            if user_question == "/save":
-                self.save_conversation()
-                continue
 
-            self.mode_auto_search_multi_turn(user_question)
+            if self._default_cli_mode == "quick":
+                self.mode_quick_qa(user_question)
+            else:
+                self.mode_deep_research(user_question)
 
 
 def main():
