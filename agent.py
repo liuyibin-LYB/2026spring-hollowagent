@@ -9,14 +9,16 @@ import json
 import os
 import random
 import re
+import difflib
 import hashlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from client import TreeholeClient
 from utils import (
@@ -44,6 +46,8 @@ ACTIVE_SESSION_FILE = os.path.join(PROJECT_DIR, "data", "active_session.json")
 CONTEXT_CACHE_DIR = os.path.join(PROJECT_DIR, "data", "context_cache")
 THOROUGH_SEARCH_DIR = os.path.join(PROJECT_DIR, "data", "thorough_search")
 DAILY_DIGEST_DIR = os.path.join(PROJECT_DIR, "data", "daily_digest")
+PID_POST_CACHE_DIR = os.path.join(PROJECT_DIR, "data", "pid_post_cache")
+COMMENT_CACHE_DIR = os.path.join(PROJECT_DIR, "data", "comment_cache")
 LATEST_PID_STATE_FILE = os.path.join(PROJECT_DIR, "data", "latest_pid_state.json")
 
 # Conversation history persistence file
@@ -87,6 +91,11 @@ INCLUDE_IMAGE_POSTS = getattr(_cfg, "INCLUDE_IMAGE_POSTS", True)
 MAX_COMMENT_FETCH_POSTS = getattr(_cfg, "MAX_COMMENT_FETCH_POSTS", 6)
 COMMENT_FETCH_MAX_PARALLEL = getattr(_cfg, "COMMENT_FETCH_MAX_PARALLEL", 10)
 COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "COMMENT_FETCH_MAX_REQUESTS_PER_SECOND", 20.0)
+PID_FETCH_MAX_PARALLEL = getattr(_cfg, "PID_FETCH_MAX_PARALLEL", 20)
+PID_FETCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "PID_FETCH_MAX_REQUESTS_PER_SECOND", 40.0)
+PID_POST_CACHE_EXPIRATION = getattr(_cfg, "PID_POST_CACHE_EXPIRATION", 6 * 3600)
+PID_MISS_CACHE_EXPIRATION = getattr(_cfg, "PID_MISS_CACHE_EXPIRATION", 30 * 60)
+COMMENT_CACHE_EXPIRATION = getattr(_cfg, "COMMENT_CACHE_EXPIRATION", 6 * 3600)
 LLM_RETRY_MAX_ATTEMPTS = getattr(_cfg, "LLM_RETRY_MAX_ATTEMPTS", 5)
 LLM_RETRY_SLEEP_SECONDS = getattr(_cfg, "LLM_RETRY_SLEEP_SECONDS", 5)
 SEARCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "SEARCH_MAX_REQUESTS_PER_SECOND", 6.0)
@@ -96,9 +105,9 @@ QUICK_QA_SEARCH_BUDGET = getattr(_cfg, "QUICK_QA_SEARCH_BUDGET", 12)
 DEEP_RESEARCH_MAX_TOOL_ROUNDS = getattr(_cfg, "DEEP_RESEARCH_MAX_TOOL_ROUNDS", 10)
 DEEP_RESEARCH_SEARCH_BUDGET = getattr(_cfg, "DEEP_RESEARCH_SEARCH_BUDGET", 30)
 RECENT_PID_SCAN_HINT = getattr(_cfg, "RECENT_PID_SCAN_HINT", 8000000)
-RECENT_PID_SCAN_STEP = getattr(_cfg, "RECENT_PID_SCAN_STEP", 120)
-RECENT_PID_SCAN_MAX_PROBES = getattr(_cfg, "RECENT_PID_SCAN_MAX_PROBES", 60)
-DAILY_DIGEST_RECENT_POSTS = getattr(_cfg, "DAILY_DIGEST_RECENT_POSTS", 60)
+RECENT_PID_SCAN_STEP = getattr(_cfg, "RECENT_PID_SCAN_STEP", 5000)
+RECENT_PID_SCAN_MAX_PROBES = getattr(_cfg, "RECENT_PID_SCAN_MAX_PROBES", 1500)
+DAILY_DIGEST_RECENT_POSTS = getattr(_cfg, "DAILY_DIGEST_RECENT_POSTS", 4000)
 DAILY_DIGEST_TOP_POSTS = getattr(_cfg, "DAILY_DIGEST_TOP_POSTS", 12)
 THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD = getattr(_cfg, "THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD", -1)
 THOROUGH_SEARCH_MAX_CONTEXT_POSTS = getattr(_cfg, "THOROUGH_SEARCH_MAX_CONTEXT_POSTS", max(MAX_CONTEXT_POSTS, 30))
@@ -119,10 +128,17 @@ if not os.path.isabs(CACHE_DIR):
 class _TokenBucket:
     """Thread-safe token bucket for request rate limiting."""
 
-    def __init__(self, refill_rate: float, capacity: Optional[float] = None):
+    def __init__(
+        self,
+        refill_rate: float,
+        capacity: Optional[float] = None,
+        initial_tokens: Optional[float] = None,
+    ):
         self.refill_rate = max(0.0, float(refill_rate))
         self.capacity = max(1.0, float(capacity if capacity is not None else refill_rate or 1.0))
-        self.tokens = self.capacity
+        if initial_tokens is None:
+            initial_tokens = self.capacity
+        self.tokens = max(0.0, min(self.capacity, float(initial_tokens)))
         self.last_refill = time.time()
         self.lock = threading.Lock()
 
@@ -145,7 +161,46 @@ class _TokenBucket:
 
                 wait_s = (1.0 - self.tokens) / self.refill_rate
 
-            time.sleep(min(wait_s, 0.05))
+            time.sleep(min(wait_s, 0.01))
+
+
+class _LiveStatusTimer:
+    """Render a single-line, real-time elapsed timer for slow LLM phases."""
+
+    def __init__(self, label: str, interval: float = 0.1):
+        self.label = label
+        self.interval = max(0.05, interval)
+        self.start_ts = time.time()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._last_len = 0
+        self._wrote = False
+
+    def start(self) -> "_LiveStatusTimer":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def elapsed(self) -> float:
+        return time.time() - self.start_ts
+
+    def stop(self, clear: bool = True) -> float:
+        elapsed = self.elapsed()
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=self.interval + 0.2)
+        if clear and self._wrote:
+            print("\r" + (" " * self._last_len) + "\r", end="", flush=True)
+        return elapsed
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            line = f"{AGENT_PREFIX}{self.label}: {self.elapsed():.1f}s"
+            padding = " " * max(0, self._last_len - len(line))
+            print("\r" + line + padding, end="", flush=True)
+            self._last_len = len(line)
+            self._wrote = True
+            self._stop_event.wait(self.interval)
 
 
 class TreeholeRAGAgent:
@@ -324,7 +379,13 @@ class TreeholeRAGAgent:
         self.info_callback = None    # Callback for progress/info messages
         self._llm_request_seq = 0
         self._tool_request_seq = 0
+        self._seq_lock = threading.Lock()
         self._search_rate_limiter = _TokenBucket(SEARCH_MAX_REQUESTS_PER_SECOND)
+        self._pid_fetch_rate_limiter = _TokenBucket(
+            PID_FETCH_MAX_REQUESTS_PER_SECOND,
+            capacity=PID_FETCH_MAX_REQUESTS_PER_SECOND,
+            initial_tokens=0,
+        )
 
         # Session state
         self._conversation_history: List[Dict[str, Any]] = []
@@ -341,10 +402,15 @@ class TreeholeRAGAgent:
         self._task_memory_file: Optional[str] = None
         self._agent_knowledge: str = ""
         self._last_memory_snapshot_hash: str = ""
-        self._comment_rate_limiter = _TokenBucket(COMMENT_FETCH_MAX_REQUESTS_PER_SECOND)
+        self._comment_rate_limiter = _TokenBucket(
+            COMMENT_FETCH_MAX_REQUESTS_PER_SECOND,
+            capacity=COMMENT_FETCH_MAX_REQUESTS_PER_SECOND,
+            initial_tokens=0,
+        )
         self._comment_metrics_lock = threading.Lock()
         self._comment_fetch_stats: Dict[str, Any] = self._new_comment_fetch_stats()
         self._post_cache: Dict[int, Dict[str, Any]] = {}
+        self._post_miss_cache: Dict[int, float] = {}
 
         # Load persistent agent knowledge and ensure data directories exist.
         os.makedirs(TASK_MEMORY_DIR, exist_ok=True)
@@ -352,7 +418,10 @@ class TreeholeRAGAgent:
         os.makedirs(CONTEXT_CACHE_DIR, exist_ok=True)
         os.makedirs(THOROUGH_SEARCH_DIR, exist_ok=True)
         os.makedirs(DAILY_DIGEST_DIR, exist_ok=True)
+        os.makedirs(PID_POST_CACHE_DIR, exist_ok=True)
+        os.makedirs(COMMENT_CACHE_DIR, exist_ok=True)
         self._agent_knowledge = self._load_agent_knowledge()
+        self._configure_http_pool()
 
         # Ensure login
         if not self.client.ensure_login(USERNAME, PASSWORD, interactive=interactive):
@@ -364,11 +433,31 @@ class TreeholeRAGAgent:
 
         print(f"{AGENT_PREFIX}✓ 树洞 RAG Agent 初始化成功")
 
+    def _configure_http_pool(self) -> None:
+        """Align requests' connection pool with our worker concurrency."""
+        session = getattr(self.client, "session", None)
+        if session is None:
+            return
+        pool_size = max(
+            10,
+            int(COMMENT_FETCH_MAX_PARALLEL),
+            int(PID_FETCH_MAX_PARALLEL),
+            int(SEARCH_MAX_REQUESTS_PER_SECOND),
+        )
+        adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, pool_block=True)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
     def _emit_info(self, message: str) -> None:
         """Print and forward user-visible runtime updates."""
         print(f"{AGENT_PREFIX}{message}")
         if self.info_callback:
             self.info_callback(message)
+
+    def _next_tool_request_id(self) -> int:
+        with self._seq_lock:
+            self._tool_request_seq += 1
+            return self._tool_request_seq
 
     # ------------------------------------------------------------------ #
     #                        Random delay helpers                         #
@@ -866,40 +955,136 @@ class TreeholeRAGAgent:
             mapping[pid] = post
         target_posts[:] = list(mapping.values())
 
+    def _pid_post_cache_file(self, pid: int) -> str:
+        return os.path.join(PID_POST_CACHE_DIR, f"{int(pid)}.json")
+
+    def _load_pid_post_cache(self, pid: int) -> Optional[Any]:
+        """Load persistent PID cache entry. Returns dict post, None for cached miss, or False for no cache."""
+        now = time.time()
+        if pid in self._post_cache:
+            return dict(self._post_cache[pid])
+        miss_ts = self._post_miss_cache.get(pid)
+        if miss_ts and now - miss_ts <= PID_MISS_CACHE_EXPIRATION:
+            return None
+
+        path = self._pid_post_cache_file(pid)
+        payload = load_json(path)
+        if not isinstance(payload, dict):
+            return False
+
+        cached_at = float(payload.get("cached_at") or 0.0)
+        found = bool(payload.get("found"))
+        ttl = PID_POST_CACHE_EXPIRATION if found else PID_MISS_CACHE_EXPIRATION
+        if ttl > 0 and cached_at > 0 and now - cached_at > ttl:
+            return False
+
+        if not found:
+            self._post_miss_cache[pid] = cached_at or now
+            return None
+
+        post = payload.get("post")
+        if not isinstance(post, dict):
+            return False
+        normalized = self._normalize_post_metadata(dict(post))
+        self._post_cache[pid] = dict(normalized)
+        return normalized
+
+    def _save_pid_post_cache(self, pid: int, post: Optional[Dict[str, Any]]) -> None:
+        """Persist one PID lookup result for later daily scans."""
+        payload = {
+            "pid": int(pid),
+            "found": bool(post),
+            "post": post if post else None,
+            "cached_at": time.time(),
+            "updated_at": self._now_str(),
+        }
+        save_json(payload, self._pid_post_cache_file(pid))
+        if post:
+            self._post_cache[int(pid)] = dict(post)
+        else:
+            self._post_miss_cache[int(pid)] = payload["cached_at"]
+
+    def _comment_cache_file(self, pid: int) -> str:
+        return os.path.join(COMMENT_CACHE_DIR, f"{int(pid)}.json")
+
+    def _load_persistent_comments(self, pid: int) -> Optional[List[Dict[str, Any]]]:
+        payload = load_json(self._comment_cache_file(pid))
+        if not isinstance(payload, dict):
+            return None
+        cached_at = float(payload.get("cached_at") or 0.0)
+        if COMMENT_CACHE_EXPIRATION > 0 and cached_at > 0 and time.time() - cached_at > COMMENT_CACHE_EXPIRATION:
+            return None
+        comments = payload.get("comments")
+        if not isinstance(comments, list):
+            return None
+        normalized = [self._normalize_comment_metadata(c) for c in comments if isinstance(c, dict)]
+        self._all_comments_cache[int(pid)] = normalized
+        return normalized
+
+    def _save_persistent_comments(self, pid: int, comments: List[Dict[str, Any]]) -> None:
+        save_json(
+            {
+                "pid": int(pid),
+                "comments": comments,
+                "cached_at": time.time(),
+                "updated_at": self._now_str(),
+            },
+            self._comment_cache_file(pid),
+        )
+
     def get_post_by_pid(
         self,
         pid: int,
         include_comments: bool = False,
         max_comments: int = MAX_COMMENTS_PER_POST,
+        quiet: bool = False,
+        use_cache: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """Fetch one post by pid and optionally hydrate comments."""
-        tool_id = self._tool_request_seq = self._tool_request_seq + 1
+        pid = int(pid)
+        tool_id = None
+        if not quiet:
+            tool_id = self._next_tool_request_id()
         start_ts = time.time()
-        if pid in self._post_cache:
-            cached_post = dict(self._post_cache[pid])
+        cached = self._load_pid_post_cache(pid) if use_cache else False
+        if isinstance(cached, dict):
+            cached_post = dict(cached)
             if include_comments:
                 cached_post["comments"] = self._load_comments_for_post(cached_post, max_comments)
-            self._emit_info(
-                f"Tool#{tool_id} get_post_by_pid 命中缓存: pid={pid}, 耗时 {time.time() - start_ts:.2f}s"
-            )
+            if not quiet:
+                self._emit_info(
+                    f"Tool#{tool_id} get_post_by_pid 命中缓存: pid={pid}, 耗时 {time.time() - start_ts:.2f}s"
+                )
             return cached_post
+        if cached is None:
+            if not quiet:
+                self._emit_info(
+                    f"Tool#{tool_id} get_post_by_pid 命中未找到缓存: pid={pid}, 耗时 {time.time() - start_ts:.2f}s"
+                )
+            return None
 
         try:
-            self._emit_info(f"Tool#{tool_id} get_post_by_pid 开始: pid={pid}")
+            if not quiet:
+                self._emit_info(f"Tool#{tool_id} get_post_by_pid 开始: pid={pid}")
+            self._pid_fetch_rate_limiter.acquire()
             result = self.client.get_post(pid)
             if not result.get("success"):
-                self._emit_info(f"Tool#{tool_id} get_post_by_pid 未找到: pid={pid}")
+                self._save_pid_post_cache(pid, None)
+                if not quiet:
+                    self._emit_info(f"Tool#{tool_id} get_post_by_pid 未找到: pid={pid}")
                 return None
             post = self._normalize_post_metadata(result.get("data", {}))
-            self._post_cache[pid] = dict(post)
+            self._save_pid_post_cache(pid, post)
             if include_comments:
                 post["comments"] = self._load_comments_for_post(post, max_comments)
-            self._emit_info(
-                f"Tool#{tool_id} get_post_by_pid 完成: pid={pid}, 耗时 {time.time() - start_ts:.2f}s"
-            )
+            if not quiet:
+                self._emit_info(
+                    f"Tool#{tool_id} get_post_by_pid 完成: pid={pid}, 耗时 {time.time() - start_ts:.2f}s"
+                )
             return post
         except Exception as e:
-            self._emit_info(f"Tool#{tool_id} get_post_by_pid 失败: pid={pid}, error={e}")
+            if not quiet:
+                self._emit_info(f"Tool#{tool_id} get_post_by_pid 失败: pid={pid}, error={e}")
             return None
 
     def get_comments_by_pid(
@@ -909,10 +1094,13 @@ class TreeholeRAGAgent:
         sort: str = "asc",
     ) -> List[Dict[str, Any]]:
         """Fetch comments by pid directly with pagination and global rate limit."""
-        tool_id = self._tool_request_seq = self._tool_request_seq + 1
+        pid = int(pid)
+        tool_id = self._next_tool_request_id()
         start_ts = time.time()
-        if pid in self._all_comments_cache:
-            cached = self._all_comments_cache[pid]
+        cached = self._all_comments_cache.get(pid)
+        if cached is None:
+            cached = self._load_persistent_comments(pid)
+        if cached is not None:
             if max_comments == -1:
                 self._emit_info(
                     f"Tool#{tool_id} get_comments_by_pid 命中缓存: pid={pid}, comments={len(cached)}, 耗时 {time.time() - start_ts:.2f}s"
@@ -951,6 +1139,7 @@ class TreeholeRAGAgent:
             page += 1
 
         self._all_comments_cache[pid] = comments
+        self._save_persistent_comments(pid, comments)
         if max_comments == -1:
             self._emit_info(
                 f"Tool#{tool_id} get_comments_by_pid 完成: pid={pid}, comments={len(comments)}, 耗时 {time.time() - start_ts:.2f}s"
@@ -972,7 +1161,10 @@ class TreeholeRAGAgent:
             "selected_posts": 0,
             "completed_posts": 0,
             "failed_posts": 0,
+            "active_posts": 0,
+            "peak_active_posts": 0,
             "request_timestamps": [],
+            "completion_timestamps": [],
         }
 
     def _reset_comment_fetch_stats(self, selected_posts: int) -> None:
@@ -992,11 +1184,29 @@ class TreeholeRAGAgent:
             self._comment_fetch_stats["api_requests"] += 1
             self._comment_fetch_stats["request_timestamps"].append(time.time())
 
+    def _record_comment_worker_started(self) -> None:
+        """Record one active post-level comment worker."""
+        with self._comment_metrics_lock:
+            active = int(self._comment_fetch_stats.get("active_posts", 0)) + 1
+            self._comment_fetch_stats["active_posts"] = active
+            self._comment_fetch_stats["peak_active_posts"] = max(
+                int(self._comment_fetch_stats.get("peak_active_posts", 0)),
+                active,
+            )
+
+    def _record_comment_worker_finished(self) -> None:
+        """Record one completed post-level comment worker."""
+        with self._comment_metrics_lock:
+            active = max(0, int(self._comment_fetch_stats.get("active_posts", 0)) - 1)
+            self._comment_fetch_stats["active_posts"] = active
+            self._comment_fetch_stats["completion_timestamps"].append(time.time())
+
     def _log_comment_fetch_stats(self) -> None:
         """Print concise request/concurrency metrics for one hydration batch."""
         with self._comment_metrics_lock:
             stats = dict(self._comment_fetch_stats)
             req_ts = list(stats.get("request_timestamps", []))
+            done_ts = list(stats.get("completion_timestamps", []))
 
         started_at = float(stats.get("started_at") or time.time())
         elapsed = max(0.001, time.time() - started_at)
@@ -1005,20 +1215,25 @@ class TreeholeRAGAgent:
         completed_posts = int(stats.get("completed_posts", 0))
         failed_posts = int(stats.get("failed_posts", 0))
         cache_hits = int(stats.get("cache_hits", 0))
-
+        peak_active_posts = int(stats.get("peak_active_posts", 0))
+        submit_rate = api_requests / elapsed
+        completion_rate = (completed_posts + failed_posts) / elapsed
+        burst_submit_rate = 0.0
         if len(req_ts) > 1:
             request_span = max(0.001, req_ts[-1] - req_ts[0])
-            submit_rate = (len(req_ts) - 1) / request_span
-        else:
-            submit_rate = len(req_ts) / elapsed
+            burst_submit_rate = (len(req_ts) - 1) / request_span
+        first_req_delay = (req_ts[0] - started_at) if req_ts else 0.0
+        last_done_delay = (done_ts[-1] - started_at) if done_ts else elapsed
 
         msg = (
             "评论抓取统计: "
             f"候选 {selected_posts} 帖, 完成 {completed_posts}, 失败 {failed_posts}, "
             f"缓存命中 {cache_hits}, 请求 {api_requests}, "
-            f"耗时 {elapsed:.2f}s, 平均发起速率 {submit_rate:.2f} req/s, "
-            f"并发上限 {max(1, COMMENT_FETCH_MAX_PARALLEL)}, "
-            f"速率上限 {COMMENT_FETCH_MAX_REQUESTS_PER_SECOND:.2f} req/s"
+            f"耗时 {elapsed:.2f}s, 完成吞吐 {completion_rate:.2f} posts/s, "
+            f"平均提交 {submit_rate:.2f} req/s, 瞬时提交峰值 {burst_submit_rate:.2f} req/s, "
+            f"活跃worker峰值 {peak_active_posts}/{max(1, COMMENT_FETCH_MAX_PARALLEL)}, "
+            f"首请求 {first_req_delay:.2f}s, 最后完成 {last_done_delay:.2f}s, "
+            f"提交速率上限 {COMMENT_FETCH_MAX_REQUESTS_PER_SECOND:.2f} req/s"
         )
         self._emit_info(msg)
 
@@ -1187,6 +1402,61 @@ class TreeholeRAGAgent:
 
         return self._heuristic_select_posts_for_comments(valid_posts, query, max_selected)
 
+    @staticmethod
+    def _nonnegative_int(value: Any, default: int = 0) -> int:
+        try:
+            return max(0, int(value or default))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _int_or_default(value: Any, default: int = 0) -> int:
+        try:
+            if value is None or value == "":
+                return int(default)
+            return int(value)
+        except Exception:
+            return int(default)
+
+    def _post_has_sufficient_comments(self, post: Dict[str, Any], max_comments: int) -> bool:
+        """Return True when comment hydration would not add useful context."""
+        if max_comments == 0:
+            return True
+
+        existing_comments = [
+            self._normalize_comment_metadata(c)
+            for c in (post.get("comments") or post.get("comment_list") or [])
+            if isinstance(c, dict)
+        ]
+        raw_comment_total = post.get("comment_total")
+        comment_total = self._nonnegative_int(raw_comment_total, 0) if raw_comment_total is not None else -1
+
+        if max_comments != -1 and len(existing_comments) >= max_comments:
+            return True
+        if max_comments == -1:
+            if comment_total == 0:
+                return True
+            if comment_total > 0 and len(existing_comments) >= comment_total:
+                return True
+
+        pid = post.get("pid")
+        if not pid:
+            return False
+        try:
+            pid_int = int(pid)
+        except Exception:
+            return False
+
+        cached_comments = self._all_comments_cache.get(pid_int)
+        if cached_comments is None:
+            cached_comments = self._load_persistent_comments(pid_int)
+        if cached_comments is None:
+            return False
+
+        if max_comments == -1:
+            return bool(comment_total > 0 and len(cached_comments) >= comment_total)
+        return len(cached_comments) >= max_comments or bool(comment_total > 0 and len(cached_comments) >= comment_total)
+
     def _load_comments_for_post(self, post: Dict[str, Any], max_comments: int) -> List[Dict[str, Any]]:
         """Load comments for a post with configurable cap (-1 for all)."""
         pid = post.get("pid")
@@ -1206,14 +1476,16 @@ class TreeholeRAGAgent:
             return []
 
         cached_comments = self._all_comments_cache.get(pid)
-        if cached_comments:
+        if cached_comments is None:
+            cached_comments = self._load_persistent_comments(pid)
+        if cached_comments is not None:
             self._inc_comment_stat("cache_hits")
             if max_comments == -1:
                 if comment_total and len(cached_comments) < comment_total:
                     pass
                 else:
                     return cached_comments
-            elif len(cached_comments) >= max_comments:
+            elif len(cached_comments) >= max_comments or (comment_total and len(cached_comments) >= comment_total):
                 return cached_comments[:max_comments]
 
         if max_comments != -1 and len(existing_comments) >= max_comments:
@@ -1261,6 +1533,7 @@ class TreeholeRAGAgent:
             all_comments = existing_comments
 
         self._all_comments_cache[pid] = all_comments
+        self._save_persistent_comments(pid, all_comments)
         if max_comments == -1:
             return all_comments
         return all_comments[:max_comments]
@@ -1284,13 +1557,21 @@ class TreeholeRAGAgent:
                 post["comments"] = []
             return normalized_posts
 
+        fetch_candidates = [
+            post
+            for post in normalized_posts
+            if not self._post_has_sufficient_comments(post, max_comments)
+        ]
         effective_selected_limit = selected_limit if selected_limit is not None else MAX_COMMENT_FETCH_POSTS
-        effective_selected_limit = max(0, min(effective_selected_limit, len(normalized_posts)))
-        selected_pids = self._select_posts_for_comment_fetch(
-            normalized_posts,
-            query=selection_query,
-            max_selected=effective_selected_limit,
-        )
+        effective_selected_limit = max(0, min(effective_selected_limit, len(fetch_candidates)))
+        if fetch_candidates and effective_selected_limit > 0:
+            selected_pids = self._select_posts_for_comment_fetch(
+                fetch_candidates,
+                query=selection_query,
+                max_selected=effective_selected_limit,
+            )
+        else:
+            selected_pids = []
         selected_set = set(selected_pids)
 
         # Reorder so selected posts are prioritized into limited context.
@@ -1312,16 +1593,27 @@ class TreeholeRAGAgent:
         )
         if selected_pids:
             self._emit_info(f"AI 选中帖子 PID: {', '.join(str(pid) for pid in selected_pids)}")
+        context_pids = [str(p.get("pid")) for p in context_posts if p.get("pid")]
+        if context_pids:
+            suffix = "" if len(context_pids) <= 40 else f" ...（共 {len(context_pids)} 帖）"
+            self._emit_info(f"进入 LLM 上下文 PID: {', '.join(context_pids[:40])}{suffix}")
 
         comments_by_pid: Dict[int, List[Dict[str, Any]]] = {}
         if effective_selected_set:
+            fetch_pids = [str(pid) for pid in selected_pids if pid in effective_selected_set]
+            if fetch_pids:
+                self._emit_info(f"实际补拉评论 PID: {', '.join(fetch_pids)}")
             self._reset_comment_fetch_stats(len(effective_selected_set))
             max_workers = max(1, min(COMMENT_FETCH_MAX_PARALLEL, len(effective_selected_set)))
 
             def fetch_for_post(p: Dict[str, Any]) -> Any:
-                pid = int(p.get("pid"))
-                comments = self._load_comments_for_post(p, max_comments)
-                return pid, comments
+                self._record_comment_worker_started()
+                try:
+                    pid = int(p.get("pid"))
+                    comments = self._load_comments_for_post(p, max_comments)
+                    return pid, comments
+                finally:
+                    self._record_comment_worker_finished()
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_pid = {
@@ -1387,7 +1679,7 @@ class TreeholeRAGAgent:
                 cached = load_json(cache_file) or []
                 return [self._normalize_post_metadata(post) for post in cached]
 
-        tool_id = self._tool_request_seq = self._tool_request_seq + 1
+        tool_id = self._next_tool_request_id()
         start_ts = time.time()
         self._emit_info(f"Tool#{tool_id} search_treehole 开始: {keyword}")
 
@@ -1609,6 +1901,8 @@ class TreeholeRAGAgent:
         url = self._get_chat_completions_url()
 
         for attempt in range(1, LLM_RETRY_MAX_ATTEMPTS + 1):
+            phase_timer: Optional[_LiveStatusTimer] = None
+            thinking_timer: Optional[_LiveStatusTimer] = None
             try:
                 self._llm_request_seq += 1
                 request_id = self._llm_request_seq
@@ -1616,6 +1910,7 @@ class TreeholeRAGAgent:
                 self._emit_info(
                     f"LLM#{request_id} 开始请求（stream={'on' if stream else 'off'}, messages={len(messages)}, attempt={attempt}）"
                 )
+                phase_timer = _LiveStatusTimer(f"LLM#{request_id} 等待响应").start()
                 if stream:
                     response = requests.post(
                         url,
@@ -1643,16 +1938,32 @@ class TreeholeRAGAgent:
                                         reasoning = self._extract_reasoning_content(delta)
                                         if reasoning and first_reasoning_ts is None:
                                             first_reasoning_ts = time.time()
+                                            response_elapsed = phase_timer.stop() if phase_timer else first_reasoning_ts - start_ts
+                                            phase_timer = None
                                             self._emit_info(
-                                                f"LLM#{request_id} 首个思考片段: {first_reasoning_ts - start_ts:.2f}s"
+                                                f"LLM#{request_id} 开始思考: 响应延迟 {response_elapsed:.2f}s"
                                             )
+                                            thinking_timer = _LiveStatusTimer(f"LLM#{request_id} 思考中").start()
                                         content = delta.get('content', '')
                                         if content:
                                             if first_output_ts is None:
                                                 first_output_ts = time.time()
-                                                self._emit_info(
-                                                    f"LLM#{request_id} 首个输出片段: {first_output_ts - start_ts:.2f}s"
-                                                )
+                                                if thinking_timer:
+                                                    thinking_elapsed = thinking_timer.stop()
+                                                    thinking_timer = None
+                                                    self._emit_info(
+                                                        f"LLM#{request_id} 开始输出: 思考 {thinking_elapsed:.2f}s, 首字延迟 {first_output_ts - start_ts:.2f}s"
+                                                    )
+                                                elif phase_timer:
+                                                    response_elapsed = phase_timer.stop()
+                                                    phase_timer = None
+                                                    self._emit_info(
+                                                        f"LLM#{request_id} 开始输出: 响应延迟 {response_elapsed:.2f}s"
+                                                    )
+                                                else:
+                                                    self._emit_info(
+                                                        f"LLM#{request_id} 开始输出: 首字延迟 {first_output_ts - start_ts:.2f}s"
+                                                    )
                                             cb = self.stream_callback or callback
                                             if cb:
                                                 cb(content)
@@ -1662,6 +1973,13 @@ class TreeholeRAGAgent:
                                 except json.JSONDecodeError:
                                     continue
 
+                    if thinking_timer:
+                        thinking_elapsed = thinking_timer.stop()
+                        thinking_timer = None
+                        self._emit_info(f"LLM#{request_id} 思考结束: {thinking_elapsed:.2f}s")
+                    if phase_timer:
+                        phase_timer.stop()
+                        phase_timer = None
                     if not (self.stream_callback or callback):
                         print()
                     self._emit_info(
@@ -1677,11 +1995,20 @@ class TreeholeRAGAgent:
                     )
                     response.raise_for_status()
                     result = response.json()
+                    if phase_timer:
+                        phase_timer.stop()
+                        phase_timer = None
                     self._emit_info(
                         f"LLM#{request_id} 完成: {time.time() - start_ts:.2f}s（非流式）"
                     )
                     return result["choices"][0]["message"]["content"]
             except Exception as e:
+                if thinking_timer:
+                    thinking_timer.stop()
+                    thinking_timer = None
+                if phase_timer:
+                    phase_timer.stop()
+                    phase_timer = None
                 if attempt < LLM_RETRY_MAX_ATTEMPTS and self._is_retryable_llm_error(e):
                     self._wait_before_llm_retry(attempt, e)
                     continue
@@ -1724,6 +2051,8 @@ class TreeholeRAGAgent:
         use_parallel_tool_calls = bool(tools) and self.enable_parallel_tool_calls
 
         for attempt in range(1, LLM_RETRY_MAX_ATTEMPTS + 1):
+            phase_timer: Optional[_LiveStatusTimer] = None
+            thinking_timer: Optional[_LiveStatusTimer] = None
             try:
                 self._llm_request_seq += 1
                 request_id = self._llm_request_seq
@@ -1735,6 +2064,7 @@ class TreeholeRAGAgent:
                 self._emit_info(
                     f"LLM#{request_id} 开始工具请求（stream={'on' if stream else 'off'}, tools={len(tools)}, messages={len(messages)}, attempt={attempt}）"
                 )
+                phase_timer = _LiveStatusTimer(f"LLM#{request_id} 等待响应").start()
 
                 if stream:
                     response = requests.post(
@@ -1767,9 +2097,12 @@ class TreeholeRAGAgent:
                                         if reasoning_content:
                                             if first_reasoning_ts is None:
                                                 first_reasoning_ts = time.time()
+                                                response_elapsed = phase_timer.stop() if phase_timer else first_reasoning_ts - start_ts
+                                                phase_timer = None
                                                 self._emit_info(
-                                                    f"LLM#{request_id} 首个思考片段: {first_reasoning_ts - start_ts:.2f}s"
+                                                    f"LLM#{request_id} 开始思考: 响应延迟 {response_elapsed:.2f}s"
                                                 )
+                                                thinking_timer = _LiveStatusTimer(f"LLM#{request_id} 思考中").start()
                                             full_reasoning_content += reasoning_content
                                         if delta.get('tool_calls') and tool_calls_raw is None:
                                             tool_calls_raw = delta['tool_calls']
@@ -1777,9 +2110,22 @@ class TreeholeRAGAgent:
                                         if content:
                                             if first_output_ts is None:
                                                 first_output_ts = time.time()
-                                                self._emit_info(
-                                                    f"LLM#{request_id} 首个输出片段: {first_output_ts - start_ts:.2f}s"
-                                                )
+                                                if thinking_timer:
+                                                    thinking_elapsed = thinking_timer.stop()
+                                                    thinking_timer = None
+                                                    self._emit_info(
+                                                        f"LLM#{request_id} 开始输出: 思考 {thinking_elapsed:.2f}s, 首字延迟 {first_output_ts - start_ts:.2f}s"
+                                                    )
+                                                elif phase_timer:
+                                                    response_elapsed = phase_timer.stop()
+                                                    phase_timer = None
+                                                    self._emit_info(
+                                                        f"LLM#{request_id} 开始输出: 响应延迟 {response_elapsed:.2f}s"
+                                                    )
+                                                else:
+                                                    self._emit_info(
+                                                        f"LLM#{request_id} 开始输出: 首字延迟 {first_output_ts - start_ts:.2f}s"
+                                                    )
                                             if self.stream_callback:
                                                 self.stream_callback(content)
                                             else:
@@ -1788,6 +2134,13 @@ class TreeholeRAGAgent:
                                 except json.JSONDecodeError:
                                     continue
 
+                    if thinking_timer:
+                        thinking_elapsed = thinking_timer.stop()
+                        thinking_timer = None
+                        self._emit_info(f"LLM#{request_id} 思考结束: {thinking_elapsed:.2f}s")
+                    if phase_timer:
+                        phase_timer.stop()
+                        phase_timer = None
                     if tool_calls_raw:
                         self._emit_info(
                             f"LLM#{request_id} 完成: {time.time() - start_ts:.2f}s, tool_calls={len(tool_calls_raw)}, 输出 {len(full_content)} 字符"
@@ -1816,6 +2169,9 @@ class TreeholeRAGAgent:
                     result = response.json()
                     choice = result["choices"][0]
                     message = choice["message"]
+                    if phase_timer:
+                        phase_timer.stop()
+                        phase_timer = None
                     self._emit_info(
                         f"LLM#{request_id} 完成: {time.time() - start_ts:.2f}s（非流式）"
                     )
@@ -1831,9 +2187,21 @@ class TreeholeRAGAgent:
                     and "parallel_tool_calls" in detail_lower
                     and any(k in detail_lower for k in ["unknown", "unsupported", "invalid", "extra", "not allowed"])
                 ):
+                    if thinking_timer:
+                        thinking_timer.stop()
+                        thinking_timer = None
+                    if phase_timer:
+                        phase_timer.stop()
+                        phase_timer = None
                     use_parallel_tool_calls = False
                     continue
 
+                if thinking_timer:
+                    thinking_timer.stop()
+                    thinking_timer = None
+                if phase_timer:
+                    phase_timer.stop()
+                    phase_timer = None
                 if attempt < LLM_RETRY_MAX_ATTEMPTS and self._is_retryable_llm_error(e):
                     self._wait_before_llm_retry(attempt, e)
                     continue
@@ -1910,9 +2278,13 @@ class TreeholeRAGAgent:
         self._reset_comment_fetch_stats(len(normalized_posts))
 
         def fetch(post: Dict[str, Any]) -> Any:
-            pid = int(post["pid"])
-            comments = self._load_comments_for_post(post, max_comments=max_comments)
-            return pid, comments
+            self._record_comment_worker_started()
+            try:
+                pid = int(post["pid"])
+                comments = self._load_comments_for_post(post, max_comments=max_comments)
+                return pid, comments
+            finally:
+                self._record_comment_worker_finished()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {executor.submit(fetch, post): int(post["pid"]) for post in normalized_posts}
@@ -1944,6 +2316,247 @@ class TreeholeRAGAgent:
                 }
             )
         return refs
+
+    @staticmethod
+    def _parse_tool_call_args(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            args = json.loads(tool_call["function"].get("arguments", "{}") or "{}")
+            return args if isinstance(args, dict) else {}
+        except Exception:
+            return {}
+
+    def _execute_tool_calls_batch(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_calls: List[Dict[str, Any]],
+        working_posts: List[Dict[str, Any]],
+        search_history: List[Dict[str, Any]],
+        profile: str,
+        search_used: int,
+        search_budget: int,
+        search_results_per_call: int,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Execute one assistant tool-call batch concurrently, then merge in original order."""
+        profile_cfg = self.MODE_PROFILES[profile]
+        prepared: List[Dict[str, Any]] = []
+
+        for idx, tool_call in enumerate(tool_calls):
+            function = tool_call.get("function") or {}
+            name = function.get("name", "")
+            args = self._parse_tool_call_args(tool_call)
+            item: Dict[str, Any] = {
+                "idx": idx,
+                "tool_call": tool_call,
+                "name": name,
+                "args": args,
+                "execute": False,
+                "skip_content": None,
+            }
+
+            if name == "search_treehole":
+                if search_used >= search_budget:
+                    item["skip_content"] = "search_treehole 预算已用尽，请改用已有帖子继续分析，或直接准备总结。"
+                else:
+                    keyword = str(args.get("keyword", "") or "").strip()
+                    reason = str(args.get("reason", "") or "").strip()
+                    search_used += 1
+                    self._conversation_search_count += 1
+                    iteration = self._conversation_search_count
+                    item.update({"execute": True, "keyword": keyword, "reason": reason, "iteration": iteration})
+                    search_history.append(
+                        {
+                            "iteration": iteration,
+                            "mode": profile,
+                            "action": "search",
+                            "keyword": keyword,
+                            "reason": reason,
+                        }
+                    )
+                    self._append_task_memory(
+                        f"- [{profile}] search#{iteration}: keyword={keyword or '-'} reason={reason or '-'}"
+                    )
+            elif name == "get_post_by_pid":
+                pid = self._int_or_default(args.get("pid"), 0)
+                include_comments = bool(args.get("include_comments", True))
+                max_comments = self._int_or_default(
+                    args.get("max_comments"),
+                    profile_cfg["comment_limit"],
+                )
+                reason = str(args.get("reason", "") or "").strip()
+                item.update(
+                    {
+                        "execute": pid > 0,
+                        "pid": pid,
+                        "include_comments": include_comments,
+                        "max_comments": max_comments,
+                        "reason": reason,
+                    }
+                )
+                if pid <= 0:
+                    item["skip_content"] = "get_post_by_pid 缺少有效 PID。"
+                search_history.append(
+                    {
+                        "iteration": self._conversation_search_count,
+                        "mode": profile,
+                        "action": "get_post",
+                        "pid": pid,
+                        "reason": reason,
+                    }
+                )
+                self._append_task_memory(
+                    f"- [{profile}] get_post: pid={pid} include_comments={include_comments} max_comments={max_comments}"
+                )
+            elif name == "get_comments_by_pid":
+                pid = self._int_or_default(args.get("pid"), 0)
+                max_comments = self._int_or_default(
+                    args.get("max_comments"),
+                    profile_cfg["comment_limit"],
+                )
+                sort = str(args.get("sort", "asc") or "asc").lower()
+                reason = str(args.get("reason", "") or "").strip()
+                item.update(
+                    {
+                        "execute": pid > 0,
+                        "pid": pid,
+                        "max_comments": max_comments,
+                        "sort": sort,
+                        "reason": reason,
+                    }
+                )
+                if pid <= 0:
+                    item["skip_content"] = "get_comments_by_pid 缺少有效 PID。"
+                search_history.append(
+                    {
+                        "iteration": self._conversation_search_count,
+                        "mode": profile,
+                        "action": "get_comment",
+                        "pid": pid,
+                        "max_comments": max_comments,
+                        "reason": reason,
+                    }
+                )
+                self._append_task_memory(
+                    f"- [{profile}] get_comment: pid={pid} max_comments={max_comments} sort={sort}"
+                )
+            else:
+                item["skip_content"] = f"未知工具: {name or '-'}"
+
+            prepared.append(item)
+
+        def run_tool(item: Dict[str, Any]) -> Dict[str, Any]:
+            name = item["name"]
+            if name == "search_treehole":
+                return {
+                    "posts": self.search_treehole(
+                        item.get("keyword", ""),
+                        max_results=search_results_per_call,
+                    )
+                }
+            if name == "get_post_by_pid":
+                return {
+                    "post": self.get_post_by_pid(
+                        item["pid"],
+                        include_comments=item["include_comments"],
+                        max_comments=item["max_comments"],
+                    )
+                }
+            if name == "get_comments_by_pid":
+                return {
+                    "comments": self.get_comments_by_pid(
+                        item["pid"],
+                        max_comments=item["max_comments"],
+                        sort=item["sort"],
+                    )
+                }
+            return {}
+
+        results_by_idx: Dict[int, Dict[str, Any]] = {}
+        executable = [item for item in prepared if item.get("execute")]
+        if executable:
+            max_workers = max(1, min(len(executable), max(4, int(COMMENT_FETCH_MAX_PARALLEL))))
+            if len(executable) > 1:
+                self._emit_info(f"并发执行本轮 {len(executable)} 个工具调用，workers={max_workers}")
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_item = {executor.submit(run_tool, item): item for item in executable}
+                for future in as_completed(future_to_item):
+                    item = future_to_item[future]
+                    try:
+                        results_by_idx[item["idx"]] = future.result()
+                    except Exception as e:
+                        results_by_idx[item["idx"]] = {"error": str(e)}
+
+        batch_new_posts: List[Dict[str, Any]] = []
+        for item in prepared:
+            tool_call = item["tool_call"]
+            name = item["name"]
+            result = results_by_idx.get(item["idx"], {})
+            result_summary = item.get("skip_content")
+            if not result_summary:
+                if result.get("error"):
+                    result_summary = f"{name} 执行失败: {result['error']}"
+                elif name == "search_treehole":
+                    posts = result.get("posts") or []
+                    self._upsert_posts(working_posts, posts)
+                    self._upsert_session_posts(posts)
+                    batch_new_posts.extend(posts)
+                    keyword = item.get("keyword", "")
+                    if posts:
+                        result_summary = (
+                            f"搜索到 {len(posts)} 个帖子。以下是带评论预览的轻量摘要：\n"
+                            + self._format_search_brief(
+                                posts,
+                                max_items=min(12, profile_cfg["context_post_limit"]),
+                                include_comment_preview=True,
+                                preview_comments_per_post=3,
+                            )
+                        )
+                    else:
+                        result_summary = f"未找到关于「{keyword}」的相关帖子。"
+                elif name == "get_post_by_pid":
+                    post = result.get("post")
+                    pid = item.get("pid", 0)
+                    include_comments = item.get("include_comments", True)
+                    max_comments = item.get("max_comments", profile_cfg["comment_limit"])
+                    if post:
+                        self._upsert_posts(working_posts, [post])
+                        self._upsert_session_posts([post])
+                        batch_new_posts.append(post)
+                        result_summary = (
+                            f"已获取帖子 #{pid}：\n\n"
+                            f"{format_post_to_text(post, include_comments=include_comments, max_comments=max_comments)}"
+                        )
+                    else:
+                        result_summary = f"未能获取帖子 #{pid}。"
+                elif name == "get_comments_by_pid":
+                    pid = item.get("pid", 0)
+                    comments = result.get("comments") or []
+                    for post in working_posts:
+                        if self._int_or_default(post.get("pid"), 0) == pid:
+                            post["comments"] = comments
+                            break
+                    if pid in self._session_posts:
+                        self._session_posts[pid]["comments"] = comments
+
+                    preview_lines = [
+                        f"{idx}. {self._compact_text_preview(comment.get('text', ''), max_len=80)}"
+                        for idx, comment in enumerate(comments[:10], 1)
+                    ]
+                    result_summary = (
+                        f"已获取帖子 #{pid} 评论，共 {len(comments)} 条（展示前 10 条）：\n"
+                        + ("\n".join(preview_lines) if preview_lines else "无评论或拉取失败")
+                    )
+                else:
+                    result_summary = f"未知工具: {name or '-'}"
+
+            messages_entry = {
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "name": name,
+                "content": result_summary,
+            }
+            messages.append(messages_entry)
+
+        return batch_new_posts, search_used
 
     def _execute_research_loop(
         self,
@@ -1982,151 +2595,16 @@ class TreeholeRAGAgent:
             )
 
             batch_new_posts: List[Dict[str, Any]] = []
-            for tool_call in tool_calls:
-                name = tool_call["function"]["name"]
-                try:
-                    args = json.loads(tool_call["function"].get("arguments", "{}") or "{}")
-                except Exception:
-                    args = {}
-
-                if name == "search_treehole":
-                    if search_used >= search_budget:
-                        result_summary = "search_treehole 预算已用尽，请改用已有帖子继续分析，或直接准备总结。"
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call["id"],
-                                "name": "search_treehole",
-                                "content": result_summary,
-                            }
-                        )
-                        continue
-
-                    keyword = str(args.get("keyword", "") or "").strip()
-                    reason = str(args.get("reason", "") or "").strip()
-                    search_used += 1
-                    self._conversation_search_count += 1
-                    iteration = self._conversation_search_count
-                    search_history.append(
-                        {
-                            "iteration": iteration,
-                            "mode": profile,
-                            "action": "search",
-                            "keyword": keyword,
-                            "reason": reason,
-                        }
-                    )
-                    self._append_task_memory(
-                        f"- [{profile}] search#{iteration}: keyword={keyword or '-'} reason={reason or '-'}"
-                    )
-
-                    posts = self.search_treehole(keyword, max_results=search_results_per_call)
-                    self._upsert_posts(working_posts, posts)
-                    self._upsert_session_posts(posts)
-                    batch_new_posts.extend(posts)
-
-                    if posts:
-                        result_summary = (
-                            f"搜索到 {len(posts)} 个帖子。以下是带评论预览的轻量摘要：\n"
-                            + self._format_search_brief(
-                                posts,
-                                max_items=min(12, profile_cfg["context_post_limit"]),
-                                include_comment_preview=True,
-                                preview_comments_per_post=3,
-                            )
-                        )
-                    else:
-                        result_summary = f"未找到关于「{keyword}」的相关帖子。"
-
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": "search_treehole",
-                            "content": result_summary,
-                        }
-                    )
-
-                elif name == "get_post_by_pid":
-                    pid = int(args.get("pid", 0) or 0)
-                    include_comments = bool(args.get("include_comments", True))
-                    max_comments = int(args.get("max_comments", profile_cfg["comment_limit"]) or profile_cfg["comment_limit"])
-                    reason = str(args.get("reason", "") or "").strip()
-                    search_history.append(
-                        {
-                            "iteration": self._conversation_search_count,
-                            "mode": profile,
-                            "action": "get_post",
-                            "pid": pid,
-                            "reason": reason,
-                        }
-                    )
-                    self._append_task_memory(
-                        f"- [{profile}] get_post: pid={pid} include_comments={include_comments} max_comments={max_comments}"
-                    )
-                    post = self.get_post_by_pid(pid, include_comments=include_comments, max_comments=max_comments)
-                    if post:
-                        self._upsert_posts(working_posts, [post])
-                        self._upsert_session_posts([post])
-                        batch_new_posts.append(post)
-                        result_summary = f"已获取帖子 #{pid}：\n\n{format_post_to_text(post, include_comments=include_comments, max_comments=max_comments)}"
-                    else:
-                        result_summary = f"未能获取帖子 #{pid}。"
-
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": "get_post_by_pid",
-                            "content": result_summary,
-                        }
-                    )
-
-                elif name == "get_comments_by_pid":
-                    pid = int(args.get("pid", 0) or 0)
-                    max_comments = int(args.get("max_comments", profile_cfg["comment_limit"]) or profile_cfg["comment_limit"])
-                    sort = str(args.get("sort", "asc") or "asc").lower()
-                    reason = str(args.get("reason", "") or "").strip()
-                    search_history.append(
-                        {
-                            "iteration": self._conversation_search_count,
-                            "mode": profile,
-                            "action": "get_comment",
-                            "pid": pid,
-                            "max_comments": max_comments,
-                            "reason": reason,
-                        }
-                    )
-                    self._append_task_memory(
-                        f"- [{profile}] get_comment: pid={pid} max_comments={max_comments} sort={sort}"
-                    )
-                    comments = self.get_comments_by_pid(pid, max_comments=max_comments, sort=sort)
-
-                    for post in working_posts:
-                        if int(post.get("pid", 0) or 0) == pid:
-                            post["comments"] = comments
-                            break
-                    if pid in self._session_posts:
-                        self._session_posts[pid]["comments"] = comments
-
-                    preview_lines = []
-                    for idx, comment in enumerate(comments[:10], 1):
-                        preview_lines.append(
-                            f"{idx}. {self._compact_text_preview(comment.get('text', ''), max_len=80)}"
-                        )
-                    result_summary = (
-                        f"已获取帖子 #{pid} 评论，共 {len(comments)} 条（展示前10条）：\n"
-                        + ("\n".join(preview_lines) if preview_lines else "无评论或拉取失败")
-                    )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": "get_comments_by_pid",
-                            "content": result_summary,
-                        }
-                    )
-
+            batch_new_posts, search_used = self._execute_tool_calls_batch(
+                messages=messages,
+                tool_calls=tool_calls,
+                working_posts=working_posts,
+                search_history=search_history,
+                profile=profile,
+                search_used=search_used,
+                search_budget=search_budget,
+                search_results_per_call=search_results_per_call,
+            )
             if batch_new_posts:
                 self._emit_info(
                     f"本轮工具调用后新增/更新 {len({p.get('pid') for p in batch_new_posts if p.get('pid')})} 帖，当前会话累计 {len(self._session_posts)} 帖"
@@ -2242,74 +2720,193 @@ class TreeholeRAGAgent:
             LATEST_PID_STATE_FILE,
         )
 
-    def _discover_latest_pid(self) -> int:
-        seed_pid = self._load_latest_pid_state()
-        step = max(20, RECENT_PID_SCAN_STEP)
-        best_pid = 0
-        pid = seed_pid
-        probes = 0
-        consecutive_misses = 0
-        self._emit_info(f"开始探测最新 PID，起点 {seed_pid}")
+    @staticmethod
+    def _build_pid_probe_steps(initial_step: int) -> List[int]:
+        """Build coarse-to-fine PID probe steps, e.g. 5000 -> 1000 -> 200 -> 50 -> 10 -> 1."""
+        preferred_steps = [5000, 1000, 200, 50, 10, 1]
+        step = max(1, int(initial_step or 1))
+        steps: List[int] = [step]
+        for preferred in preferred_steps:
+            if preferred < step and preferred not in steps:
+                steps.append(preferred)
+        if steps[-1] != 1:
+            steps.append(1)
+        return steps
 
-        while probes < RECENT_PID_SCAN_MAX_PROBES:
-            post = self.get_post_by_pid(pid, include_comments=False)
+    def _find_existing_anchor_pid(self, seed_pid: int, max_backtrack: int = 1000) -> Tuple[int, int]:
+        """Find a confirmed existing PID at or below seed_pid for upward probing."""
+        lower_bound = max(1, seed_pid - max(0, max_backtrack))
+        probes = 0
+        for candidate_pid in range(seed_pid, lower_bound - 1, -1):
+            post = self.get_post_by_pid(candidate_pid, include_comments=False, use_cache=False)
             probes += 1
             if post:
-                best_pid = max(best_pid, pid)
-                consecutive_misses = 0
-                pid += step
-            else:
-                consecutive_misses += 1
-                pid += step
-                if best_pid and consecutive_misses >= 3:
-                    break
+                if candidate_pid != seed_pid:
+                    self._emit_info(f"起点 PID {seed_pid} 不可见，回退到已确认存在的 PID {candidate_pid}")
+                return candidate_pid, probes
+        self._emit_info(f"未能在 {seed_pid} 下方 {max_backtrack} 范围内确认存在 PID，暂以 {seed_pid} 为锚点")
+        return seed_pid, probes
 
-        if not best_pid:
-            best_pid = seed_pid
+    def _discover_latest_pid(self) -> int:
+        seed_pid = self._load_latest_pid_state()
+        steps = self._build_pid_probe_steps(max(1, RECENT_PID_SCAN_STEP))
+        best_pid, probes = self._find_existing_anchor_pid(seed_pid)
+        miss_threshold = 5
+        probe_budget = max(RECENT_PID_SCAN_MAX_PROBES, len(steps) * miss_threshold + 20)
+        self._emit_info(f"开始探测最新 PID，起点 {seed_pid}，步长序列 {steps}")
 
-        upper_bound = best_pid + step
-        for candidate_pid in range(best_pid, upper_bound + 1):
-            post = self.get_post_by_pid(candidate_pid, include_comments=False)
-            if post:
-                best_pid = max(best_pid, candidate_pid)
+        for step in steps:
+            if probes >= probe_budget:
+                break
+            consecutive_misses = 0
+            hits = 0
+            candidate_pid = best_pid + step
+            while probes < probe_budget and consecutive_misses < miss_threshold:
+                post = self.get_post_by_pid(candidate_pid, include_comments=False, use_cache=False)
+                probes += 1
+                if post:
+                    best_pid = candidate_pid
+                    hits += 1
+                    consecutive_misses = 0
+                    candidate_pid = best_pid + step
+                else:
+                    consecutive_misses += 1
+                    candidate_pid += step
+
+            self._emit_info(
+                f"PID 探测步长 {step} 完成: 命中 {hits} 次, best={best_pid}, 连续空洞={consecutive_misses}, probes={probes}"
+            )
+
+        if probes >= probe_budget:
+            self._emit_info("PID 探测达到最大探测次数，使用当前 best 作为最新 PID 估计")
 
         self._save_latest_pid_state(best_pid)
         self._emit_info(f"最新有效 PID 估计为 {best_pid}")
         return best_pid
 
-    def _collect_recent_posts_by_pid(self, count: int, latest_pid: Optional[int] = None) -> List[Dict[str, Any]]:
+    def _collect_recent_posts_by_pid(
+        self,
+        count: int,
+        latest_pid: Optional[int] = None,
+        stop_pid: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         latest_pid = latest_pid or self._discover_latest_pid()
         posts: List[Dict[str, Any]] = []
         pid = latest_pid
         attempts = 0
-        max_attempts = max(count * 6, count + 50)
-        while pid > 0 and len(posts) < count and attempts < max_attempts:
-            post = self.get_post_by_pid(pid, include_comments=False)
-            attempts += 1
-            if post:
-                posts.append(post)
-            pid -= 1
-        self._emit_info(f"最近 PID 扫描完成: 命中 {len(posts)} 帖, latest_pid={latest_pid}")
+        lower_bound = max(0, int(stop_pid or 0))
+        max_attempts = max(count * 8, count + 1000)
+        max_workers = max(1, int(PID_FETCH_MAX_PARALLEL))
+        batch_size = min(100, max(max_workers, max(1, count) * 2))
+        batch_no = 0
+        self._emit_info(
+            f"最近 PID 并发扫描开始: 目标 {count} 帖, latest_pid={latest_pid}, "
+            f"并发 {max_workers}, 提交速率上限 {PID_FETCH_MAX_REQUESTS_PER_SECOND:.2f} req/s"
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            while pid > lower_bound and len(posts) < count and attempts < max_attempts:
+                candidate_pids: List[int] = []
+                while (
+                    pid > lower_bound
+                    and attempts + len(candidate_pids) < max_attempts
+                    and len(candidate_pids) < batch_size
+                ):
+                    candidate_pids.append(pid)
+                    pid -= 1
+                if not candidate_pids:
+                    break
+
+                batch_no += 1
+                batch_start = time.time()
+                future_to_pid = {
+                    executor.submit(self.get_post_by_pid, candidate_pid, False, MAX_COMMENTS_PER_POST, True): candidate_pid
+                    for candidate_pid in candidate_pids
+                }
+                batch_results: Dict[int, Dict[str, Any]] = {}
+                for future in as_completed(future_to_pid):
+                    candidate_pid = future_to_pid[future]
+                    try:
+                        post = future.result()
+                        if post:
+                            batch_results[candidate_pid] = post
+                    except Exception as e:
+                        self._emit_info(f"警告: 并发获取 PID {candidate_pid} 失败: {e}")
+
+                attempts += len(candidate_pids)
+                for candidate_pid in candidate_pids:
+                    post = batch_results.get(candidate_pid)
+                    if post:
+                        posts.append(post)
+                        if len(posts) >= count:
+                            break
+
+                self._emit_info(
+                    f"最近 PID 扫描批次 {batch_no}: "
+                    f"pid {candidate_pids[0]}->{candidate_pids[-1]}, "
+                    f"命中 {len(batch_results)}/{len(candidate_pids)}, "
+                    f"累计 {len(posts)}/{count}, 耗时 {time.time() - batch_start:.2f}s"
+                )
+
+        misses = attempts - len(posts)
+        range_hint = f"{latest_pid}->{lower_bound + 1}" if lower_bound else f"latest_pid={latest_pid}"
+        self._emit_info(
+            f"最近 PID 扫描完成: 命中 {len(posts)} 帖, 空洞 {misses} 个, 扫描范围 {range_hint}"
+        )
         return posts
 
     @staticmethod
     def _score_daily_post(post: Dict[str, Any]) -> float:
         reply_count = max(0, int(post.get("reply_count", post.get("reply", 0)) or 0))
         star_count = max(0, int(post.get("star_count", post.get("likenum", 0)) or 0))
-        comment_total = max(0, int(post.get("comment_total", 0) or 0))
         pid_bonus = int(post.get("pid", 0) or 0) / 1_000_000.0
-        return reply_count * 1.0 + star_count * 1.6 + comment_total * 0.35 + pid_bonus
+        reply_aux = min(reply_count, 50) * 0.12 + max(0, reply_count - 50) * 0.02
+        return star_count * 10.0 + reply_aux + pid_bonus
+
+    def _format_daily_ranked_index(
+        self,
+        posts: List[Dict[str, Any]],
+        latest_pid: int,
+        previous_latest_pid: int,
+        candidate_count: int,
+        limit: int = 120,
+    ) -> str:
+        lines = [
+            "# 每日神帖候选排序",
+            "",
+            f"- previous_latest_pid: {previous_latest_pid}",
+            f"- latest_pid: {latest_pid}",
+            f"- candidate_count: {candidate_count}",
+            "- score: star_count * 10 + capped_reply_aux + tiny_pid_bonus",
+            "",
+        ]
+        for idx, post in enumerate(posts[:limit], 1):
+            pid = post.get("pid")
+            reply_count = int(post.get("reply_count", post.get("reply", 0)) or 0)
+            star_count = int(post.get("star_count", post.get("likenum", 0)) or 0)
+            lines.append(
+                f"{idx}. pid={pid} | score={self._score_daily_post(post):.2f} | "
+                f"star={star_count} | reply={reply_count} | time={post.get('post_time')} | "
+                f"{self._compact_text_preview(post.get('text', ''), max_len=120)}"
+            )
+        return "\n".join(lines)
 
     def mode_daily_hot_digest(self, recent_post_count: int = DAILY_DIGEST_RECENT_POSTS) -> Dict[str, Any]:
         print_header("模式 1: 每日神帖汇总")
+        previous_latest_pid = self._load_latest_pid_state()
         latest_pid = self._discover_latest_pid()
-        recent_posts = self._collect_recent_posts_by_pid(recent_post_count, latest_pid=latest_pid)
+        recent_posts = self._collect_recent_posts_by_pid(
+            recent_post_count,
+            latest_pid=latest_pid,
+        )
         ranked_posts = sorted(recent_posts, key=self._score_daily_post, reverse=True)
         top_posts = ranked_posts[:max(DAILY_DIGEST_TOP_POSTS, 1)]
+        self._emit_info(
+            f"每日候选 {len(recent_posts)} 帖，按收藏优先排序后取前 {len(top_posts)} 帖进入日报上下文"
+        )
         hydrated_posts = self._hydrate_posts_for_context(
             top_posts,
             max_comments=min(MAX_COMMENTS_PER_POST if MAX_COMMENTS_PER_POST > 0 else 10, 10) if MAX_COMMENTS_PER_POST != -1 else 10,
-            selection_query="每日神帖 热门 热度 质量 高回复 高收藏",
+            selection_query="每日神帖 高质量 高收藏 收藏量优先 回复数仅辅助",
             context_post_limit=len(top_posts),
             selected_limit=len(top_posts),
         )
@@ -2317,8 +2914,20 @@ class TreeholeRAGAgent:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = os.path.join(DAILY_DIGEST_DIR, run_id)
         os.makedirs(run_dir, exist_ok=True)
+        candidates_json_path = os.path.join(run_dir, "daily_candidates.json")
+        ranked_index_path = os.path.join(run_dir, "daily_ranked_index.md")
         raw_json_path = os.path.join(run_dir, "daily_hot_posts.json")
         raw_md_path = os.path.join(run_dir, "daily_hot_posts.md")
+        save_json(recent_posts, candidates_json_path)
+        self._save_text_artifact(
+            ranked_index_path,
+            self._format_daily_ranked_index(
+                ranked_posts,
+                latest_pid=latest_pid,
+                previous_latest_pid=previous_latest_pid,
+                candidate_count=len(recent_posts),
+            ),
+        )
         save_json(hydrated_posts, raw_json_path)
         self._save_text_artifact(
             raw_md_path,
@@ -2327,10 +2936,12 @@ class TreeholeRAGAgent:
 
         system_message = (
             "你是北大树洞日报助手。请根据给定的近期帖子，产出一份“每日神帖汇总”。"
-            "优先说明为什么这些帖子热、为什么值得看，并明确引用 pid。"
+            "筛选标准以收藏量和信息质量为主，回复数只作为辅助信号，因为高回复可能来自少数人在评论区聊天。"
+            "请说明为什么这些帖子值得看，并明确引用 pid。"
         )
         user_message = (
-            f"最近抓取的帖子来自最新 PID 附近，共筛出 {len(hydrated_posts)} 帖高热候选。\n"
+            f"最近抓取的帖子来自 PID {latest_pid} 附近，共扫描 {len(recent_posts)} 帖有效候选，"
+            f"按收藏优先筛出 {len(hydrated_posts)} 帖高质量候选。\n"
             f"请输出一份简洁但信息充分的中文日报。\n\n"
             f"{format_posts_batch(hydrated_posts, include_comments=True, max_comments=10)}"
         )
@@ -2349,6 +2960,8 @@ class TreeholeRAGAgent:
             "sources": self._summarize_source_refs(hydrated_posts),
             "num_sources": len(hydrated_posts),
             "artifacts": {
+                "candidates": candidates_json_path,
+                "ranked_index": ranked_index_path,
                 "json": raw_json_path,
                 "markdown": raw_md_path,
                 "digest": answer_path,
@@ -2494,11 +3107,29 @@ class TreeholeRAGAgent:
         if not command.startswith("/"):
             return False
 
-        if command in {"/help", "/?"}:
+        parts = command.split(maxsplit=1)
+        command_name = parts[0].lower()
+        command_args = parts[1].strip() if len(parts) > 1 else ""
+        known_commands = [
+            "/help",
+            "/?",
+            "/mode",
+            "/daily",
+            "/thorough",
+            "/sessions",
+            "/resume",
+            "/history",
+            "/new",
+            "/reset",
+            "/save",
+            "/quit",
+        ]
+
+        if command_name in {"/help", "/?"}:
             print(
                 "\n可用命令:\n"
                 "/mode quick|deep      切换默认输入模式\n"
-                "/daily [N]            生成每日神帖汇总\n"
+                "/daily N              生成每日神帖汇总，例如 /daily 4000\n"
                 "/thorough kw1,kw2 | 问题   做 thorough search 并回答\n"
                 "/sessions             查看历史会话列表\n"
                 "/resume <session_id>  恢复指定会话\n"
@@ -2509,8 +3140,11 @@ class TreeholeRAGAgent:
             )
             return True
 
-        if command.startswith("/mode "):
-            mode = command.split(maxsplit=1)[1].strip().lower()
+        if command_name == "/mode":
+            if not command_args:
+                self._emit_info("用法: /mode quick|deep")
+                return True
+            mode = command_args.lower()
             if mode not in self.MODE_PROFILES:
                 self._emit_info(f"未知模式: {mode}")
                 return True
@@ -2518,54 +3152,76 @@ class TreeholeRAGAgent:
             self._emit_info(f"默认模式已切换为 {self.MODE_PROFILES[mode]['label']}")
             return True
 
-        if command.startswith("/daily"):
-            parts = command.split()
+        if command_name == "/daily":
             count = DAILY_DIGEST_RECENT_POSTS
-            if len(parts) > 1 and parts[1].isdigit():
-                count = int(parts[1])
+            if command_args:
+                raw_count = command_args
+                bracketed_count = re.fullmatch(r"\[(\d+)\]", raw_count)
+                if bracketed_count:
+                    raw_count = bracketed_count.group(1)
+                if not raw_count.isdigit():
+                    self._emit_info("用法: /daily [N]，N 必须是正整数")
+                    return True
+                count = int(raw_count)
+                if count <= 0:
+                    self._emit_info("用法: /daily [N]，N 必须是正整数")
+                    return True
             self.mode_daily_hot_digest(recent_post_count=count)
             return True
 
-        if command.startswith("/thorough "):
-            payload = command[len("/thorough "):].strip()
+        if command_name == "/thorough":
+            if not command_args:
+                self._emit_info("用法: /thorough kw1,kw2 | 问题")
+                return True
+            payload = command_args
             keywords_part, _, question_part = payload.partition("|")
             keywords = [item.strip() for item in keywords_part.split(",") if item.strip()]
+            if not keywords:
+                self._emit_info("用法: /thorough kw1,kw2 | 问题，至少需要一个关键词")
+                return True
             question = question_part.strip() or None
             self.mode_thorough_search(keywords=keywords, question=question)
             return True
 
-        if command == "/sessions":
+        if command_name == "/sessions":
             print("\n" + self.render_session_list() + "\n")
             return True
 
-        if command.startswith("/resume "):
-            session_id = command.split(maxsplit=1)[1].strip()
+        if command_name == "/resume":
+            if not command_args:
+                self._emit_info("用法: /resume <session_id>")
+                return True
+            session_id = command_args
             if self._load_session_by_id(session_id):
                 self._emit_info(f"已恢复会话: {session_id}")
             else:
                 self._emit_info(f"未找到会话: {session_id}")
             return True
 
-        if command.startswith("/history"):
-            parts = command.split(maxsplit=1)
-            session_id = parts[1].strip() if len(parts) > 1 else None
+        if command_name == "/history":
+            session_id = command_args or None
             print("\n" + self.render_session_history(session_id=session_id) + "\n")
             return True
 
-        if command in {"/new", "/reset"}:
+        if command_name in {"/new", "/reset"}:
             self.reset_conversation()
             return True
 
-        if command == "/save":
+        if command_name == "/save":
             self.save_conversation()
             return True
 
-        if command == "/quit":
+        if command_name == "/quit":
             self.save_conversation()
             self._emit_info("退出多轮对话")
             raise KeyboardInterrupt
 
-        return False
+        suggestion = difflib.get_close_matches(command_name, known_commands, n=1)
+        if suggestion:
+            self._emit_info(f"未知命令: {command_name}。你是不是想输入 {suggestion[0]}？输入 /help 查看全部命令。")
+        else:
+            self._emit_info(f"未知命令: {command_name}。输入 /help 查看全部命令。")
+        return True
 
     # ------------------------------------------------------------------ #
     #                      Interactive CLI                                #

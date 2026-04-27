@@ -13,6 +13,20 @@ from http.cookiejar import Cookie
 
 import requests
 
+DEFAULT_TREEHOLE_REQUEST_TIMEOUT = (10, 30)
+
+
+def _load_default_timeout():
+    """Load request timeout from local config without making config mandatory."""
+    try:
+        import config_private as cfg
+    except ImportError:
+        try:
+            import config as cfg
+        except ImportError:
+            return DEFAULT_TREEHOLE_REQUEST_TIMEOUT
+    return getattr(cfg, "TREEHOLE_REQUEST_TIMEOUT", DEFAULT_TREEHOLE_REQUEST_TIMEOUT)
+
 
 class TreeHoleWeb(enum.Enum):
     """
@@ -34,15 +48,17 @@ class TreeholeClient:
     Handles authentication, post/comment retrieval, and search functionality.
     """
 
-    def __init__(self, cookies_file=None):
+    def __init__(self, cookies_file=None, request_timeout=None):
         """
         Initialize the client, set headers, and load cookies if available.
         
         Args:
             cookies_file (str): Path to the cookies file for session persistence.
                               If None, defaults to <project>/.treehole_cookies.json
+            request_timeout: requests timeout value, e.g. 30 or (10, 30).
         """
         self.session = requests.Session()
+        self.request_timeout = _load_default_timeout() if request_timeout is None else request_timeout
         # Use project directory by default for consistency
         if cookies_file is None:
             cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".treehole_cookies.json")
@@ -62,6 +78,12 @@ class TreeholeClient:
                 {"authorization": f"Bearer {self.authorization}"}
             )
 
+    def _request(self, method, url, **kwargs):
+        """Issue a Treehole HTTP request with the configured timeout."""
+        if self.request_timeout is not None and "timeout" not in kwargs:
+            kwargs["timeout"] = self.request_timeout
+        return self.session.request(method, url, **kwargs)
+
     def oauth_login(self, username, password):
         """
         Perform OAuth login with username and password.
@@ -73,7 +95,8 @@ class TreeholeClient:
         Returns:
             dict: JSON response from the server.
         """
-        response = self.session.post(
+        response = self._request(
+            "POST",
             TreeHoleWeb.OAUTH_LOGIN.value,
             data={
                 "appid": "PKU Helper",
@@ -99,7 +122,8 @@ class TreeholeClient:
             requests.Response: The HTTP response object.
         """
         rand = str(random.random())
-        response = self.session.get(
+        response = self._request(
+            "GET",
             TreeHoleWeb.SSO_LOGIN.value,
             params={
                 "uuid": str(uuid.uuid4()).split("-")[-1],
@@ -122,7 +146,7 @@ class TreeholeClient:
         Returns:
             requests.Response: The HTTP response object.
         """
-        response = self.session.get(TreeHoleWeb.UN_READ.value)
+        response = self._request("GET", TreeHoleWeb.UN_READ.value)
         return response
 
     def login_by_token(self, token):
@@ -135,7 +159,8 @@ class TreeholeClient:
         Returns:
             requests.Response: The HTTP response object.
         """
-        response = self.session.post(
+        response = self._request(
+            "POST",
             TreeHoleWeb.LOGIN_BY_TOKEN.value, data={"code": token}  # API expects 'code' not 'token'
         )
         response.raise_for_status()
@@ -167,7 +192,8 @@ class TreeholeClient:
         Returns:
             requests.Response: The HTTP response object.
         """
-        response = self.session.post(
+        response = self._request(
+            "POST",
             TreeHoleWeb.LOGIN_BY_MESSAGE.value, data={"valid_code": code}
         )
         response.raise_for_status()
@@ -188,7 +214,7 @@ class TreeholeClient:
         Returns:
             requests.Response: The HTTP response object.
         """
-        response = self.session.post(TreeHoleWeb.SEND_MESSAGE.value)
+        response = self._request("POST", TreeHoleWeb.SEND_MESSAGE.value)
         response.raise_for_status()
         return response
 
@@ -202,7 +228,7 @@ class TreeholeClient:
         Returns:
             dict: JSON response containing the post data.
         """
-        response = self.session.get(f"https://treehole.pku.edu.cn/api/pku/{post_id}")
+        response = self._request("GET", f"https://treehole.pku.edu.cn/api/pku/{post_id}")
         response.raise_for_status()
         return response.json()
 
@@ -219,7 +245,8 @@ class TreeholeClient:
         Returns:
             dict: JSON response containing the comments data.
         """
-        response = self.session.get(
+        response = self._request(
+            "GET",
             f"https://treehole.pku.edu.cn/api/pku_comment_v3/{post_id}",
             params={"page": page, "limit": limit, "sort": sort},
         )
@@ -280,7 +307,7 @@ class TreeholeClient:
         params.update(kwargs)
         
         # Make the request
-        response = self.session.get(url, params=params)
+        response = self._request("GET", url, params=params)
         response.raise_for_status()
         
         result = response.json()

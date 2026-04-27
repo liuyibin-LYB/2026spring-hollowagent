@@ -106,6 +106,7 @@ MAX_CONTEXT_POSTS = 30
 # Maximum number of comments to include per post (for mode 1 & 2)
 # Set to 0 to disable comments, -1 for unlimited
 MAX_COMMENTS_PER_POST = 5
+MAX_COMMENT_FETCH_POSTS = 6
 
 # Maximum number of search iterations in mode_auto_search (智能检索模式)
 MAX_SEARCH_ITERATIONS = 3
@@ -120,9 +121,27 @@ MAX_RESPONSE_TOKENS = 4096
 # ==================== Rate Limiting ====================
 # Delay between search requests (seconds)
 SEARCH_DELAY = 1.0
+SEARCH_DELAY_MIN = 1.0
+SEARCH_DELAY_MAX = 3.0
+TREEHOLE_REQUEST_TIMEOUT = (10, 30)
+SEARCH_MAX_REQUESTS_PER_SECOND = 6.0
+COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = 20.0
+COMMENT_FETCH_MAX_PARALLEL = 10
+PID_FETCH_MAX_REQUESTS_PER_SECOND = 40.0
+PID_FETCH_MAX_PARALLEL = 20
+PID_POST_CACHE_EXPIRATION = 6 * 3600
+PID_MISS_CACHE_EXPIRATION = 30 * 60
+COMMENT_CACHE_EXPIRATION = 6 * 3600
 
 # Maximum retries for failed requests
 MAX_RETRIES = 3
+
+# ==================== Daily Digest ====================
+RECENT_PID_SCAN_HINT = 8000000
+RECENT_PID_SCAN_STEP = 5000
+RECENT_PID_SCAN_MAX_PROBES = 1500
+DAILY_DIGEST_RECENT_POSTS = 4000
+DAILY_DIGEST_TOP_POSTS = 12
 
 # ==================== Cache Configuration ====================
 # Enable caching of search results
