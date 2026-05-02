@@ -64,9 +64,9 @@ MAX_RESPONSE_TOKENS = 4096
 
 # ==================== Rate Limiting ====================
 # --- Search pacing ---
-# Delay between search requests (seconds) — random uniform in [MIN, MAX]
+# Delay before each keyword search (seconds) — pagination itself uses the request-rate limiter.
 SEARCH_DELAY_MIN = 1.0
-SEARCH_DELAY_MAX = 3.0
+SEARCH_DELAY_MAX = 1.0
 TREEHOLE_REQUEST_TIMEOUT = (10, 30)
 
 # ==================== Cache Configuration ====================
@@ -76,8 +76,8 @@ ENABLE_CACHE = True
 # Cache directory
 CACHE_DIR = os.path.join(PROJECT_DIR, "data", "cache")
 
-# Cache expiration time (seconds), 1 day = 86400
-CACHE_EXPIRATION = 86400
+# Cache expiration time (seconds), 7 days
+CACHE_EXPIRATION = 7 * 24 * 3600
 
 # ==================== Fixed Defaults（通常无需调整） ====================
 # 这些参数通常保持默认，日常不建议调整。
@@ -85,14 +85,14 @@ CACHE_EXPIRATION = 86400
 # 评论补拉吞吐控制
 COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = 20.0
 COMMENT_FETCH_MAX_PARALLEL = 10
-SEARCH_MAX_REQUESTS_PER_SECOND = 6.0
+SEARCH_MAX_REQUESTS_PER_SECOND = 40.0
 
 # PID 扫描吞吐控制（日常日报会大量按 PID 抓帖子）
 PID_FETCH_MAX_REQUESTS_PER_SECOND = 40.0
 PID_FETCH_MAX_PARALLEL = 20
-PID_POST_CACHE_EXPIRATION = 6 * 3600
+PID_POST_CACHE_EXPIRATION = 7 * 24 * 3600
 PID_MISS_CACHE_EXPIRATION = 30 * 60
-COMMENT_CACHE_EXPIRATION = 6 * 3600
+COMMENT_CACHE_EXPIRATION = 7 * 24 * 3600
 
 # 模式预算
 QUICK_QA_MAX_TURNS = 5

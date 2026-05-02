@@ -82,7 +82,7 @@ SEARCH_DELAY_MAX = _cfg.SEARCH_DELAY_MAX
 
 ENABLE_CACHE = _cfg.ENABLE_CACHE
 CACHE_DIR = _cfg.CACHE_DIR
-CACHE_EXPIRATION = _cfg.CACHE_EXPIRATION
+CACHE_EXPIRATION = getattr(_cfg, "CACHE_EXPIRATION", 7 * 24 * 3600)
 
 # Optional settings with backward-compatible defaults
 SEARCH_PAGE_LIMIT = getattr(_cfg, "SEARCH_PAGE_LIMIT", 30)
@@ -93,12 +93,12 @@ COMMENT_FETCH_MAX_PARALLEL = getattr(_cfg, "COMMENT_FETCH_MAX_PARALLEL", 10)
 COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "COMMENT_FETCH_MAX_REQUESTS_PER_SECOND", 20.0)
 PID_FETCH_MAX_PARALLEL = getattr(_cfg, "PID_FETCH_MAX_PARALLEL", 20)
 PID_FETCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "PID_FETCH_MAX_REQUESTS_PER_SECOND", 40.0)
-PID_POST_CACHE_EXPIRATION = getattr(_cfg, "PID_POST_CACHE_EXPIRATION", 6 * 3600)
+PID_POST_CACHE_EXPIRATION = getattr(_cfg, "PID_POST_CACHE_EXPIRATION", 7 * 24 * 3600)
 PID_MISS_CACHE_EXPIRATION = getattr(_cfg, "PID_MISS_CACHE_EXPIRATION", 30 * 60)
-COMMENT_CACHE_EXPIRATION = getattr(_cfg, "COMMENT_CACHE_EXPIRATION", 6 * 3600)
+COMMENT_CACHE_EXPIRATION = getattr(_cfg, "COMMENT_CACHE_EXPIRATION", 7 * 24 * 3600)
 LLM_RETRY_MAX_ATTEMPTS = getattr(_cfg, "LLM_RETRY_MAX_ATTEMPTS", 5)
 LLM_RETRY_SLEEP_SECONDS = getattr(_cfg, "LLM_RETRY_SLEEP_SECONDS", 5)
-SEARCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "SEARCH_MAX_REQUESTS_PER_SECOND", 6.0)
+SEARCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "SEARCH_MAX_REQUESTS_PER_SECOND", PID_FETCH_MAX_REQUESTS_PER_SECOND)
 QUICK_QA_MAX_TURNS = getattr(_cfg, "QUICK_QA_MAX_TURNS", 5)
 QUICK_QA_MAX_TOOL_ROUNDS = getattr(_cfg, "QUICK_QA_MAX_TOOL_ROUNDS", 4)
 QUICK_QA_SEARCH_BUDGET = getattr(_cfg, "QUICK_QA_SEARCH_BUDGET", 12)
@@ -380,7 +380,11 @@ class TreeholeRAGAgent:
         self._llm_request_seq = 0
         self._tool_request_seq = 0
         self._seq_lock = threading.Lock()
-        self._search_rate_limiter = _TokenBucket(SEARCH_MAX_REQUESTS_PER_SECOND)
+        self._search_rate_limiter = _TokenBucket(
+            SEARCH_MAX_REQUESTS_PER_SECOND,
+            capacity=SEARCH_MAX_REQUESTS_PER_SECOND,
+            initial_tokens=0,
+        )
         self._pid_fetch_rate_limiter = _TokenBucket(
             PID_FETCH_MAX_REQUESTS_PER_SECOND,
             capacity=PID_FETCH_MAX_REQUESTS_PER_SECOND,
@@ -1133,7 +1137,7 @@ class TreeholeRAGAgent:
                 comments = comments[:max_comments]
                 break
 
-            last_page = page_data.get("last_page", page)
+            last_page = int(page_data.get("last_page") or page)
             if page >= last_page or not page_comments:
                 break
             page += 1
@@ -1506,6 +1510,7 @@ class TreeholeRAGAgent:
 
         all_comments: List[Dict[str, Any]] = []
         page = 1
+        last_progress_ts = time.time()
         while True:
             self._comment_rate_limiter.acquire()
             self._record_comment_api_request()
@@ -1520,11 +1525,21 @@ class TreeholeRAGAgent:
             ]
             all_comments.extend(page_comments)
 
+            last_page = int(page_data.get("last_page") or page)
+            if max_comments == -1 and last_page > 1:
+                now = time.time()
+                if page == 1 or page >= last_page or page % 5 == 0 or now - last_progress_ts >= 3.0:
+                    total_hint = f"/{comment_total}" if comment_total else ""
+                    self._emit_info(
+                        f"评论抓取进度: pid={pid}, 第 {page}/{last_page} 页, "
+                        f"累计 {len(all_comments)}{total_hint} 条"
+                    )
+                    last_progress_ts = now
+
             if max_comments != -1 and len(all_comments) >= max_comments:
                 all_comments = all_comments[:max_comments]
                 break
 
-            last_page = page_data.get("last_page", page)
             if page >= last_page or not page_comments:
                 break
             page += 1
@@ -1689,12 +1704,18 @@ class TreeholeRAGAgent:
             search_comment_limit = self._resolve_search_comment_limit()
             page_limit = max(1, SEARCH_PAGE_LIMIT)
             unlimited = normalized_max_results == -1
+            if unlimited:
+                self._emit_info(
+                    f"Tool#{tool_id} search_treehole 分页抓取: "
+                    f"page_limit={page_limit}, comment_limit={search_comment_limit}, "
+                    f"速率上限 {SEARCH_MAX_REQUESTS_PER_SECOND:.2f} req/s"
+                )
 
             while unlimited or len(all_posts) < normalized_max_results:
                 request_limit = page_limit if unlimited else min(page_limit, normalized_max_results - len(all_posts))
                 self._search_rate_limiter.acquire()
-                if SEARCH_DELAY_MAX > 0 or SEARCH_DELAY_MIN > 0:
-                    self._human_delay(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX, f"搜索请求 第{page}页")
+                if page == 1 and (SEARCH_DELAY_MAX > 0 or SEARCH_DELAY_MIN > 0):
+                    self._human_delay(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX, f"搜索请求 {keyword}")
 
                 search_result = self.client.search_posts(
                     keyword,
@@ -1710,6 +1731,10 @@ class TreeholeRAGAgent:
 
                 page_posts = search_result.get("data", {}).get("data", [])
                 if not page_posts:
+                    self._emit_info(
+                        f"Tool#{tool_id} search_treehole 进度: {keyword}, "
+                        f"第 {page} 页无结果，累计 {len(all_posts)} 帖"
+                    )
                     break
 
                 normalized_posts = [self._normalize_post_metadata(post) for post in page_posts]
@@ -1718,7 +1743,17 @@ class TreeholeRAGAgent:
 
                 all_posts.extend(normalized_posts)
 
-                last_page = search_result.get("data", {}).get("last_page", page)
+                page_data = search_result.get("data", {})
+                total = int(page_data.get("total", 0) or 0)
+                last_page = int(page_data.get("last_page") or page)
+                if unlimited or page > 1 or page < last_page:
+                    total_hint = f"/{total}" if total > 0 else ""
+                    elapsed = max(0.001, time.time() - start_ts)
+                    self._emit_info(
+                        f"Tool#{tool_id} search_treehole 进度: {keyword}, "
+                        f"第 {page}/{last_page} 页, 本页 {len(page_posts)} 帖, "
+                        f"累计 {len(all_posts)}{total_hint} 帖, 耗时 {elapsed:.2f}s"
+                    )
                 if page >= last_page or len(page_posts) < request_limit:
                     break
                 page += 1
@@ -2276,6 +2311,11 @@ class TreeholeRAGAgent:
         max_workers = max(1, min(COMMENT_FETCH_MAX_PARALLEL, len(normalized_posts)))
         results: Dict[int, List[Dict[str, Any]]] = {}
         self._reset_comment_fetch_stats(len(normalized_posts))
+        batch_start = time.time()
+        self._emit_info(
+            f"批量评论抓取开始: 候选 {len(normalized_posts)} 帖, "
+            f"并发 {max_workers}, 每帖上限 {'全部' if max_comments == -1 else max_comments}"
+        )
 
         def fetch(post: Dict[str, Any]) -> Any:
             self._record_comment_worker_started()
@@ -2288,15 +2328,42 @@ class TreeholeRAGAgent:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {executor.submit(fetch, post): int(post["pid"]) for post in normalized_posts}
+            finished = 0
+            comment_count = 0
+            progress_step = max(1, min(50, len(normalized_posts) // 20 or 1))
+            last_progress_ts = batch_start
             for future in as_completed(future_map):
                 pid = future_map[future]
                 try:
                     _, comments = future.result()
                     results[pid] = comments
+                    comment_count += len(comments)
                     self._inc_comment_stat("completed_posts")
                 except Exception as e:
                     self._inc_comment_stat("failed_posts")
                     self._emit_info(f"批量评论抓取失败: pid={pid}, error={e}")
+                finally:
+                    finished += 1
+                    now = time.time()
+                    if (
+                        finished == 1
+                        or finished == len(normalized_posts)
+                        or finished % progress_step == 0
+                        or now - last_progress_ts >= 3.0
+                    ):
+                        with self._comment_metrics_lock:
+                            api_requests = int(self._comment_fetch_stats.get("api_requests", 0))
+                            failed_posts = int(self._comment_fetch_stats.get("failed_posts", 0))
+                            active_posts = int(self._comment_fetch_stats.get("active_posts", 0))
+                            cache_hits = int(self._comment_fetch_stats.get("cache_hits", 0))
+                        elapsed = max(0.001, now - batch_start)
+                        self._emit_info(
+                            f"批量评论抓取进度: {finished}/{len(normalized_posts)} 帖, "
+                            f"评论 {comment_count} 条, 失败 {failed_posts}, 缓存命中 {cache_hits}, "
+                            f"活跃 {active_posts}, 请求 {api_requests}, "
+                            f"耗时 {elapsed:.2f}s, 吞吐 {finished / elapsed:.2f} posts/s"
+                        )
+                        last_progress_ts = now
 
         self._log_comment_fetch_stats()
         hydrated = []
@@ -2988,23 +3055,37 @@ class TreeholeRAGAgent:
         run_slug = self._slug_from_text("_".join(unique_keywords), max_len=32)
         run_dir = os.path.join(THOROUGH_SEARCH_DIR, f"{run_id}_{run_slug}")
         os.makedirs(run_dir, exist_ok=True)
+        self._emit_info(
+            f"Thorough Search 开始: {len(unique_keywords)} 个关键词, "
+            f"输出目录 {run_dir}"
+        )
 
         merged_posts: Dict[int, Dict[str, Any]] = {}
         search_history = []
-        for keyword in unique_keywords:
+        for idx, keyword in enumerate(unique_keywords, 1):
+            before_count = len(merged_posts)
+            self._emit_info(f"Thorough Search 搜索关键词 {idx}/{len(unique_keywords)}: {keyword}")
             posts = self.search_treehole_exhaustive(keyword)
             search_history.append({"action": "search_all", "keyword": keyword, "count": len(posts)})
             for post in posts:
                 pid = int(post.get("pid", 0) or 0)
                 if pid:
                     merged_posts[pid] = post
+            self._emit_info(
+                f"Thorough Search 关键词完成 {idx}/{len(unique_keywords)}: {keyword}, "
+                f"拉取 {len(posts)} 帖, 新增 {len(merged_posts) - before_count} 帖, "
+                f"去重后累计 {len(merged_posts)} 帖"
+            )
 
         all_posts = sorted(merged_posts.values(), key=lambda item: int(item.get("pid", 0) or 0), reverse=True)
+        self._emit_info(f"Thorough Search 开始全量补评论: 去重后 {len(all_posts)} 帖")
         hydrated_posts = self._hydrate_all_posts_with_comments(all_posts, max_comments=-1)
+        self._emit_info(f"Thorough Search 评论补拉完成: {len(hydrated_posts)} 帖")
 
         corpus_json_path = os.path.join(run_dir, "corpus.json")
         corpus_md_path = os.path.join(run_dir, "corpus.md")
         corpus_index_path = os.path.join(run_dir, "corpus_index.md")
+        self._emit_info("Thorough Search 正在保存语料文件...")
         save_json(hydrated_posts, corpus_json_path)
         self._save_text_artifact(corpus_md_path, format_posts_batch(hydrated_posts, include_comments=True, max_comments=-1))
         self._save_text_artifact(
@@ -3015,6 +3096,9 @@ class TreeholeRAGAgent:
                 include_comment_preview=True,
                 preview_comments_per_post=2,
             ),
+        )
+        self._emit_info(
+            f"Thorough Search 语料已保存: json={corpus_json_path}, markdown={corpus_md_path}, index={corpus_index_path}"
         )
 
         answer = ""
@@ -3175,7 +3259,7 @@ class TreeholeRAGAgent:
                 return True
             payload = command_args
             keywords_part, _, question_part = payload.partition("|")
-            keywords = [item.strip() for item in keywords_part.split(",") if item.strip()]
+            keywords = [item.strip() for item in re.split(r"[,，、;；\n]+", keywords_part) if item.strip()]
             if not keywords:
                 self._emit_info("用法: /thorough kw1,kw2 | 问题，至少需要一个关键词")
                 return True

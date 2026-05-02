@@ -1,5 +1,62 @@
 # 更新日志 (CHANGELOG)
 
+## [v3.0.0] - 2026-05-02
+
+### 🚀 四模式工作流重构
+
+#### 核心模式升级
+- Agent 主流程重构为四类工作流：`每日神贴汇总`、`日常 Q&A`、`Deep Research`、`Thorough Search`
+- 新增 `mode_quick_qa()`：面向五轮以内连续追问，控制工具轮次和搜索预算，优先快速回答
+- 新增 `mode_deep_research()`：面向更大预算的渐进式调研，由 LLM 自主决定摸底、转向、聚焦和总结节奏
+- 新增 `mode_daily_hot_digest()`：从近期树洞帖子中筛选高收藏、高质量内容并生成每日神贴汇总
+- 新增 `mode_thorough_search()`：按用户指定关键词尽量抓全语料，补拉评论，保存大文件后再做 Q&A
+- 兼容旧入口：`mode_auto_search()` 默认走 `Deep Research`，`mode_auto_search_multi_turn()` 默认走 `日常 Q&A`
+
+#### 会话与上下文管理
+- 新增 session 体系：`data/sessions/<session_id>.json` 保存标题、模式、轮次、搜索次数和已抓帖子
+- 新增 compact 上下文缓存：`data/context_cache/<session_id>.json`，避免多轮对话无限堆积完整历史
+- 新增 `active_session.json`，启动后可恢复最近会话，也可按 session id 手动恢复
+- 回答前会基于当前问题重新排序 session 内帖子，并让 LLM 选择最值得补拉评论的 PID
+
+#### CLI 交互增强
+- 新增 `/mode quick|deep`：切换默认问答模式
+- 新增 `/daily N`：扫描最近 N 个有效帖子候选并生成日报
+- 新增 `/thorough kw1,kw2 | 问题`：抓全关键词语料并可直接回答问题
+- 新增 `/sessions`、`/resume <session_id>`、`/history [session_id]`：查看、恢复和审计历史会话
+- `/` 开头输入统一按命令处理，未知命令会提示相近命令，避免误发给 LLM
+
+#### 每日神贴汇总
+- 通过最新 PID 探测与回扫收集近期有效帖子，默认候选量 `DAILY_DIGEST_RECENT_POSTS = 4000`
+- 排序逻辑改为收藏量优先，回复数仅作为辅助信号，降低“评论区聊天”对热度判断的干扰
+- PID 扫描支持并发与限速：`PID_FETCH_MAX_PARALLEL`、`PID_FETCH_MAX_REQUESTS_PER_SECOND`
+- 新增 PID 单帖缓存、miss 缓存和评论缓存：`data/pid_post_cache/`、`data/comment_cache/`
+- 日报产物保存到 `data/daily_digest/<timestamp>/`，包括候选、排序索引、上下文和最终日报
+
+#### Thorough Search
+- 支持对多个关键词分别 exhaustive search，再按 PID 合并去重
+- 对完整语料尽量补拉评论，适合课程测评、历史事件、专题调研等需要“先抓全再分析”的场景
+- 产物保存到 `data/thorough_search/<timestamp>_<slug>/`
+- 输出 `corpus.json`、`corpus.md`、`corpus_index.md`，若提供问题则额外生成 `answer.md`
+
+#### OpenAI-Compatible 接口泛化
+- LLM 调用从 DeepSeek 专用逻辑泛化为 OpenAI-compatible chat completions 接口
+- 新增 `LLM_CHAT_COMPLETIONS_PATH`、`LLM_EXTRA_HEADERS`、`LLM_EXTRA_BODY`
+- 新增 `LLM_ENABLE_PARALLEL_TOOL_CALLS`，支持模型一次返回多组工具调用
+- 新增统一 reasoning 配置：`LLM_REASONING_EFFORT` 与 `LLM_THINKING_TYPE`，适配 DeepSeek V4 等思考模型
+- 新增 LLM 请求重试配置：`LLM_RETRY_MAX_ATTEMPTS`、`LLM_RETRY_SLEEP_SECONDS`
+
+#### 性能、缓存与可观测性
+- 搜索缓存新增 `CACHE_EXPIRATION`，默认 7 天，减少重复检索成本
+- 搜索、PID 抓取、评论抓取均加入请求速率控制，提升大量抓取时的稳定性
+- 评论抓取支持并发补拉，并输出批次完成吞吐、平均速率、瞬时峰值和活跃 worker 峰值
+- LLM 请求新增实时计时：等待响应、思考中、开始输出三段状态更清晰
+- Treehole API 工具调用会打印开始、结束、缓存命中和耗时，便于定位慢点
+
+#### 文档与示例同步
+- README 重写为四模式说明，补充 CLI、配置项、数据目录和兼容性说明
+- `example_usage.py` 更新为四种模式的编程调用示例
+- `start.sh` 同步新增配置项，便于一键初始化 `config_private.py`
+
 ## [v2.2.0] - 2026-03-22
 
 ### ✨ Agent 工作流升级（两阶段检索 + memory + PID工具）

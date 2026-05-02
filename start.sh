@@ -119,19 +119,19 @@ TEMPERATURE = 0.7
 MAX_RESPONSE_TOKENS = 4096
 
 # ==================== Rate Limiting ====================
-# Delay between search requests (seconds)
+# Delay before each keyword search (seconds); pagination uses SEARCH_MAX_REQUESTS_PER_SECOND.
 SEARCH_DELAY = 1.0
 SEARCH_DELAY_MIN = 1.0
-SEARCH_DELAY_MAX = 3.0
+SEARCH_DELAY_MAX = 1.0
 TREEHOLE_REQUEST_TIMEOUT = (10, 30)
-SEARCH_MAX_REQUESTS_PER_SECOND = 6.0
+SEARCH_MAX_REQUESTS_PER_SECOND = 40.0
 COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = 20.0
 COMMENT_FETCH_MAX_PARALLEL = 10
 PID_FETCH_MAX_REQUESTS_PER_SECOND = 40.0
 PID_FETCH_MAX_PARALLEL = 20
-PID_POST_CACHE_EXPIRATION = 6 * 3600
+PID_POST_CACHE_EXPIRATION = 7 * 24 * 3600
 PID_MISS_CACHE_EXPIRATION = 30 * 60
-COMMENT_CACHE_EXPIRATION = 6 * 3600
+COMMENT_CACHE_EXPIRATION = 7 * 24 * 3600
 
 # Maximum retries for failed requests
 MAX_RETRIES = 3
@@ -150,8 +150,8 @@ ENABLE_CACHE = True
 # Cache directory
 CACHE_DIR = "data/cache"
 
-# Cache expiration time (seconds), 1 day = 86400
-CACHE_EXPIRATION = 86400
+# Cache expiration time (seconds), 7 days
+CACHE_EXPIRATION = 7 * 24 * 3600
 EOF
     
     echo "✓ config_private.py 已创建"
