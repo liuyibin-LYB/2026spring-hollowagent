@@ -16,6 +16,14 @@ PASSWORD = "xxxxxx"      # Replace with your password
 
 # ==================== LLM API Configuration ====================
 # Any OpenAI-compatible chat-completions endpoint should work here.
+# DeepSeek official:
+#   LLM_API_BASE = "https://api.deepseek.com"
+#   LLM_CHAT_COMPLETIONS_PATH = "/chat/completions"
+#   LLM_MODEL = "deepseek-v4-pro"
+# SiliconFlow:
+#   LLM_API_BASE = "https://api.siliconflow.cn/v1"
+#   LLM_CHAT_COMPLETIONS_PATH = "/chat/completions"
+#   LLM_MODEL = "<copy the model id from SiliconFlow Models, e.g. deepseek-ai/DeepSeek-V3.2>"
 LLM_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 LLM_API_BASE = "https://api.deepseek.com"
 LLM_MODEL = "deepseek-v4-pro"
@@ -28,6 +36,8 @@ LLM_ENABLE_PARALLEL_TOOL_CALLS = True
 # Unified reasoning knob:
 # - OpenAI GPT-5.4-style models: none / low / medium / high / xhigh
 # - DeepSeek V4-style models: high / max (low/medium -> high, xhigh -> max, none -> thinking disabled)
+# - SiliconFlow: left out by default unless the selected model explicitly supports it;
+#   pass provider-specific fields with LLM_EXTRA_BODY, e.g. {"enable_thinking": True}.
 LLM_REASONING_EFFORT = "high"
 # Optional thinking toggle for compatible backends such as DeepSeek V4.
 # Use "auto" in most cases; set to "disabled" to force non-thinking mode.

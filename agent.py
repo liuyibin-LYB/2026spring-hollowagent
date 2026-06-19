@@ -1815,12 +1815,30 @@ class TreeholeRAGAgent:
         model_name = str(self.model or "").lower()
         return "deepseek-v4" in model_name
 
+    def _is_siliconflow_backend(self) -> bool:
+        """Return True when the configured endpoint is SiliconFlow's OpenAI-compatible API."""
+        return "siliconflow" in str(self.api_base or "").lower()
+
     def _normalize_reasoning_effort(self) -> Optional[str]:
         """Normalize configured reasoning effort to a lowercase string."""
         if not isinstance(self.reasoning_effort, str):
             return None
         normalized = self.reasoning_effort.strip().lower()
         return normalized or None
+
+    def _apply_extra_body_overrides(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply explicit backend-specific body overrides.
+
+        Setting a key to None removes it, which is useful for gateways that reject
+        optional OpenAI-compatible parameters such as reasoning_effort.
+        """
+        for key, value in self.extra_body.items():
+            key = str(key)
+            if value is None:
+                data.pop(key, None)
+            else:
+                data[key] = value
+        return data
 
     def _build_llm_payload(
         self,
@@ -1830,14 +1848,13 @@ class TreeholeRAGAgent:
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Build a chat-completions payload with optional provider-specific extras."""
-        data: Dict[str, Any] = dict(self.extra_body)
-        data.update({
+        data: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": MAX_RESPONSE_TOKENS,
             "stream": stream,
-        })
+        }
         if tools:
             data["tools"] = tools
             data["tool_choice"] = "auto"
@@ -1849,7 +1866,7 @@ class TreeholeRAGAgent:
             if candidate in {"enabled", "disabled"}:
                 thinking_type = candidate
 
-        if self._is_deepseek_v4_model():
+        if self._is_deepseek_v4_model() and not self._is_siliconflow_backend():
             # DeepSeek V4 uses OpenAI-compatible reasoning_effort, but its effective
             # values are narrowed to high/max. Keep a single config surface and map.
             mapped_effort = None
@@ -1870,9 +1887,10 @@ class TreeholeRAGAgent:
             if mapped_effort and thinking_type != "disabled":
                 data["reasoning_effort"] = mapped_effort
         else:
-            if reasoning_effort and reasoning_effort != "auto":
+            if reasoning_effort and reasoning_effort != "auto" and not self._is_siliconflow_backend():
                 data["reasoning_effort"] = reasoning_effort
-        return data
+
+        return self._apply_extra_body_overrides(data)
 
     def _extract_llm_error_detail(self, error: Exception) -> str:
         """Extract readable error details from the configured LLM backend."""

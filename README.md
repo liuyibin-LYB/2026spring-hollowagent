@@ -18,14 +18,6 @@
 ## 快速开始
 
 ```bash
-git clone git@github.com:SunVapor/pku-treehole-search-agent.git
-cd ./pku-treehole-search-agent
-bash start.sh
-```
-
-或手动：
-
-```bash
 pip install requests
 cp config.py config_private.py
 python agent.py
