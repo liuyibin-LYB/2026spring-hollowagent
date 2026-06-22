@@ -111,6 +111,8 @@ DAILY_DIGEST_RECENT_POSTS = getattr(_cfg, "DAILY_DIGEST_RECENT_POSTS", 4000)
 DAILY_DIGEST_TOP_POSTS = getattr(_cfg, "DAILY_DIGEST_TOP_POSTS", 12)
 THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD = getattr(_cfg, "THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD", -1)
 THOROUGH_SEARCH_MAX_CONTEXT_POSTS = getattr(_cfg, "THOROUGH_SEARCH_MAX_CONTEXT_POSTS", max(MAX_CONTEXT_POSTS, 30))
+THOROUGH_SEARCH_MAX_PARALLEL = getattr(_cfg, "THOROUGH_SEARCH_MAX_PARALLEL", 6)
+THOROUGH_SEARCH_PAGE_MAX_PARALLEL = getattr(_cfg, "THOROUGH_SEARCH_PAGE_MAX_PARALLEL", 10)
 SESSION_RECENT_TURNS = getattr(_cfg, "SESSION_RECENT_TURNS", 5)
 SESSION_CONTEXT_MAX_POSTS = getattr(_cfg, "SESSION_CONTEXT_MAX_POSTS", max(MAX_CONTEXT_POSTS, 40))
 
@@ -447,6 +449,7 @@ class TreeholeRAGAgent:
             int(COMMENT_FETCH_MAX_PARALLEL),
             int(PID_FETCH_MAX_PARALLEL),
             int(SEARCH_MAX_REQUESTS_PER_SECOND),
+            int(THOROUGH_SEARCH_MAX_PARALLEL) * int(THOROUGH_SEARCH_PAGE_MAX_PARALLEL),
         )
         adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, pool_block=True)
         session.mount("https://", adapter)
@@ -1704,57 +1707,158 @@ class TreeholeRAGAgent:
             search_comment_limit = self._resolve_search_comment_limit()
             page_limit = max(1, SEARCH_PAGE_LIMIT)
             unlimited = normalized_max_results == -1
-            if unlimited:
-                self._emit_info(
-                    f"Tool#{tool_id} search_treehole 分页抓取: "
-                    f"page_limit={page_limit}, comment_limit={search_comment_limit}, "
-                    f"速率上限 {SEARCH_MAX_REQUESTS_PER_SECOND:.2f} req/s"
-                )
 
-            while unlimited or len(all_posts) < normalized_max_results:
-                request_limit = page_limit if unlimited else min(page_limit, normalized_max_results - len(all_posts))
+            def normalize_search_posts(page_posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                normalized_posts = [self._normalize_post_metadata(post) for post in page_posts]
+                if not INCLUDE_IMAGE_POSTS:
+                    normalized_posts = [post for post in normalized_posts if not post.get("has_image")]
+                return normalized_posts
+
+            def fetch_search_page(page_no: int, request_limit: int, apply_initial_delay: bool = False) -> Dict[str, Any]:
                 self._search_rate_limiter.acquire()
-                if page == 1 and (SEARCH_DELAY_MAX > 0 or SEARCH_DELAY_MIN > 0):
+                if apply_initial_delay and (SEARCH_DELAY_MAX > 0 or SEARCH_DELAY_MIN > 0):
                     self._human_delay(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX, f"搜索请求 {keyword}")
 
                 search_result = self.client.search_posts(
                     keyword,
-                    page=page,
+                    page=page_no,
                     limit=request_limit,
                     comment_limit=search_comment_limit,
                 )
-
                 if not search_result.get("success"):
-                    msg = f"搜索失败: {search_result.get('message', '未知错误')}"
+                    return {
+                        "page": page_no,
+                        "posts": [],
+                        "raw_count": 0,
+                        "total": 0,
+                        "last_page": page_no,
+                        "error": search_result.get("message", "未知错误"),
+                    }
+
+                page_data = search_result.get("data", {})
+                page_posts = page_data.get("data", [])
+                return {
+                    "page": page_no,
+                    "posts": normalize_search_posts(page_posts),
+                    "raw_count": len(page_posts),
+                    "total": int(page_data.get("total", 0) or 0),
+                    "last_page": int(page_data.get("last_page") or page_no),
+                    "error": "",
+                }
+
+            if unlimited:
+                self._emit_info(
+                    f"Tool#{tool_id} search_treehole 分页抓取: "
+                    f"page_limit={page_limit}, comment_limit={search_comment_limit}, "
+                    f"速率上限 {SEARCH_MAX_REQUESTS_PER_SECOND:.2f} req/s, "
+                    f"页并发 {max(1, int(THOROUGH_SEARCH_PAGE_MAX_PARALLEL))}"
+                )
+
+                first_page = fetch_search_page(1, page_limit, apply_initial_delay=True)
+                if first_page.get("error"):
+                    self._emit_info(f"搜索失败: {first_page['error']}")
+                elif not first_page.get("raw_count"):
+                    self._emit_info(
+                        f"Tool#{tool_id} search_treehole 进度: {keyword}, "
+                        f"第 1 页无结果，累计 0 帖"
+                    )
+                else:
+                    page_results: Dict[int, Dict[str, Any]] = {1: first_page}
+                    last_page = max(1, int(first_page.get("last_page") or 1))
+                    total = int(first_page.get("total") or 0)
+                    completed_posts = len(first_page["posts"])
+                    total_hint = f"/{total}" if total > 0 else ""
+                    self._emit_info(
+                        f"Tool#{tool_id} search_treehole 进度: {keyword}, "
+                        f"第 1/{last_page} 页, 本页 {first_page['raw_count']} 帖, "
+                        f"累计 {completed_posts}{total_hint} 帖, 耗时 {time.time() - start_ts:.2f}s"
+                    )
+
+                    remaining_pages = list(range(2, last_page + 1))
+                    if remaining_pages and first_page["raw_count"] >= page_limit:
+                        max_workers = max(
+                            1,
+                            min(
+                                len(remaining_pages),
+                                max(1, int(THOROUGH_SEARCH_PAGE_MAX_PARALLEL)),
+                            ),
+                        )
+                        self._emit_info(
+                            f"Tool#{tool_id} search_treehole 并发抓取剩余 {len(remaining_pages)} 页, "
+                            f"workers={max_workers}"
+                        )
+                        progress_step = max(1, min(20, len(remaining_pages) // 10 or 1))
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            future_to_page = {
+                                executor.submit(fetch_search_page, page_no, page_limit): page_no
+                                for page_no in remaining_pages
+                            }
+                            finished_pages = 1
+                            for future in as_completed(future_to_page):
+                                page_no = future_to_page[future]
+                                finished_pages += 1
+                                try:
+                                    page_result = future.result()
+                                except Exception as e:
+                                    self._emit_info(
+                                        f"Tool#{tool_id} search_treehole 第 {page_no} 页失败: {e}"
+                                    )
+                                    continue
+                                if page_result.get("error"):
+                                    self._emit_info(
+                                        f"Tool#{tool_id} search_treehole 第 {page_no} 页失败: "
+                                        f"{page_result['error']}"
+                                    )
+                                    continue
+                                page_results[page_no] = page_result
+                                completed_posts += len(page_result["posts"])
+                                if (
+                                    finished_pages == last_page
+                                    or finished_pages % progress_step == 0
+                                ):
+                                    total_hint = f"/{total}" if total > 0 else ""
+                                    elapsed = max(0.001, time.time() - start_ts)
+                                    self._emit_info(
+                                        f"Tool#{tool_id} search_treehole 进度: {keyword}, "
+                                        f"已完成 {finished_pages}/{last_page} 页, "
+                                        f"累计 {completed_posts}{total_hint} 帖, "
+                                        f"耗时 {elapsed:.2f}s"
+                                    )
+
+                    for page_no in range(1, last_page + 1):
+                        all_posts.extend(page_results.get(page_no, {}).get("posts", []))
+
+            while unlimited or len(all_posts) < normalized_max_results:
+                if unlimited:
+                    break
+                request_limit = page_limit if unlimited else min(page_limit, normalized_max_results - len(all_posts))
+                page_result = fetch_search_page(page, request_limit, apply_initial_delay=page == 1)
+
+                if page_result.get("error"):
+                    msg = f"搜索失败: {page_result['error']}"
                     self._emit_info(msg)
                     break
 
-                page_posts = search_result.get("data", {}).get("data", [])
-                if not page_posts:
+                if not page_result.get("raw_count"):
                     self._emit_info(
                         f"Tool#{tool_id} search_treehole 进度: {keyword}, "
                         f"第 {page} 页无结果，累计 {len(all_posts)} 帖"
                     )
                     break
 
-                normalized_posts = [self._normalize_post_metadata(post) for post in page_posts]
-                if not INCLUDE_IMAGE_POSTS:
-                    normalized_posts = [post for post in normalized_posts if not post.get("has_image")]
+                all_posts.extend(page_result["posts"])
 
-                all_posts.extend(normalized_posts)
-
-                page_data = search_result.get("data", {})
-                total = int(page_data.get("total", 0) or 0)
-                last_page = int(page_data.get("last_page") or page)
+                total = int(page_result.get("total") or 0)
+                last_page = int(page_result.get("last_page") or page)
                 if unlimited or page > 1 or page < last_page:
                     total_hint = f"/{total}" if total > 0 else ""
                     elapsed = max(0.001, time.time() - start_ts)
                     self._emit_info(
                         f"Tool#{tool_id} search_treehole 进度: {keyword}, "
-                        f"第 {page}/{last_page} 页, 本页 {len(page_posts)} 帖, "
+                        f"第 {page}/{last_page} 页, 本页 {page_result['raw_count']} 帖, "
                         f"累计 {len(all_posts)}{total_hint} 帖, 耗时 {elapsed:.2f}s"
                     )
-                if page >= last_page or len(page_posts) < request_limit:
+                if page >= last_page or page_result["raw_count"] < request_limit:
                     break
                 page += 1
 
@@ -3080,10 +3184,39 @@ class TreeholeRAGAgent:
 
         merged_posts: Dict[int, Dict[str, Any]] = {}
         search_history = []
-        for idx, keyword in enumerate(unique_keywords, 1):
-            before_count = len(merged_posts)
+        keyword_workers = max(1, min(len(unique_keywords), int(THOROUGH_SEARCH_MAX_PARALLEL)))
+
+        def run_keyword_search(item: Tuple[int, str]) -> Tuple[int, str, List[Dict[str, Any]]]:
+            idx, keyword = item
             self._emit_info(f"Thorough Search 搜索关键词 {idx}/{len(unique_keywords)}: {keyword}")
             posts = self.search_treehole_exhaustive(keyword)
+            return idx, keyword, posts
+
+        if len(unique_keywords) > 1:
+            self._emit_info(
+                f"Thorough Search 并发搜索关键词: keywords={len(unique_keywords)}, workers={keyword_workers}"
+            )
+
+        keyword_items = list(enumerate(unique_keywords, 1))
+        if keyword_workers == 1:
+            keyword_results = [run_keyword_search(item) for item in keyword_items]
+        else:
+            keyword_results = []
+            with ThreadPoolExecutor(max_workers=keyword_workers) as executor:
+                future_to_item = {
+                    executor.submit(run_keyword_search, item): item
+                    for item in keyword_items
+                }
+                for future in as_completed(future_to_item):
+                    idx, keyword = future_to_item[future]
+                    try:
+                        keyword_results.append(future.result())
+                    except Exception as e:
+                        self._emit_info(f"Thorough Search 关键词失败 {idx}/{len(unique_keywords)}: {keyword}, error={e}")
+                        keyword_results.append((idx, keyword, []))
+
+        for idx, keyword, posts in sorted(keyword_results, key=lambda item: item[0]):
+            before_count = len(merged_posts)
             search_history.append({"action": "search_all", "keyword": keyword, "count": len(posts)})
             for post in posts:
                 pid = int(post.get("pid", 0) or 0)
@@ -3204,6 +3337,19 @@ class TreeholeRAGAgent:
         self._save_session()
         self._begin_new_session("新会话", self._default_cli_mode)
 
+    @staticmethod
+    def _parse_thorough_command_args(payload: str) -> Tuple[List[str], Optional[str]]:
+        parts = re.split(r"[|｜]", payload, maxsplit=1)
+        keywords_part = parts[0]
+        question_part = parts[1] if len(parts) > 1 else ""
+        keywords = [
+            item.strip()
+            for item in re.split(r"[,，、;；\n]+", keywords_part)
+            if item.strip()
+        ]
+        question = question_part.strip() or None
+        return keywords, question
+
     def _handle_cli_command(self, user_input: str) -> bool:
         command = user_input.strip()
         if not command.startswith("/"):
@@ -3232,7 +3378,7 @@ class TreeholeRAGAgent:
                 "\n可用命令:\n"
                 "/mode quick|deep      切换默认输入模式\n"
                 "/daily N              生成每日神帖汇总，例如 /daily 4000\n"
-                "/thorough kw1,kw2 | 问题   做 thorough search 并回答\n"
+                "/thorough kw1,kw2 | 问题   做 thorough search 并回答（也支持 ， 和 ｜）\n"
                 "/sessions             查看历史会话列表\n"
                 "/resume <session_id>  恢复指定会话\n"
                 "/history [session_id] 查看当前/指定会话内容\n"
@@ -3273,15 +3419,12 @@ class TreeholeRAGAgent:
 
         if command_name == "/thorough":
             if not command_args:
-                self._emit_info("用法: /thorough kw1,kw2 | 问题")
+                self._emit_info("用法: /thorough kw1,kw2 | 问题（关键词可用 ， 分隔，问题分隔符可用 ｜）")
                 return True
-            payload = command_args
-            keywords_part, _, question_part = payload.partition("|")
-            keywords = [item.strip() for item in re.split(r"[,，、;；\n]+", keywords_part) if item.strip()]
+            keywords, question = self._parse_thorough_command_args(command_args)
             if not keywords:
                 self._emit_info("用法: /thorough kw1,kw2 | 问题，至少需要一个关键词")
                 return True
-            question = question_part.strip() or None
             self.mode_thorough_search(keywords=keywords, question=question)
             return True
 

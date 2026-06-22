@@ -14,6 +14,7 @@
 - compact 上下文缓存，避免对话上下文无限膨胀
 - 搜索缓存、评论并发抓取、任务 memory
 - `/` 开头输入统一按 CLI 命令处理，输错命令会提示，不会误发给 LLM
+- 本地离线 Web 工作台：浏览缓存帖子、刷新单帖、调用真实 `agent.py` 侧栏
 
 ## 快速开始
 
@@ -32,6 +33,27 @@ LLM_API_KEY = "sk-xxx"
 LLM_API_BASE = "https://api.deepseek.com"
 LLM_MODEL = "deepseek-v4-pro"
 ```
+
+## 本地 Web 工作台
+
+除了命令行，也可以启动一个只监听本机的离线工作台：
+
+```bash
+python local_web_server.py
+```
+
+然后打开 `http://127.0.0.1:5177`。如需改端口，可设置 `PORT` 环境变量。
+
+工作台会从 `data/cache/`、`data/pid_post_cache/` 和 `data/comment_cache/` 重建本地索引。缓存很多时，首次启动可能需要等待一段时间，终端打印出监听地址后再打开页面。
+
+主要能力：
+
+- 左侧浏览本地帖子缓存，支持按正文、评论和 PID 搜索，并可按收藏数、评论数筛选。
+- 中间查看帖子正文、评论和缓存来源；刷新单帖时会通过树洞接口补最新正文与评论。
+- 已删除或不可访问的帖子会被标记为“已删除”，但本地已有正文和评论仍会尽量保留可读。
+- 右侧侧栏直接桥接真实 `agent.py` CLI，支持普通提问和 `/daily`、`/thorough` 等命令；如果 LLM 或登录配置不可用，会在页面上明确报错，不会静默降级成假回答。
+- 输入框遵循 CLI 习惯：`Enter` / `Ctrl+Enter` 发送，`Shift+Enter` 换行。
+- 左、中、右三栏可拖拽调整宽度，布局会保存到浏览器本地。
 
 ## 四种模式
 
@@ -99,7 +121,8 @@ PID 扫描是并发的：任务会批量提交到线程池，`PID_FETCH_MAX_PARA
 
 流程：
 
-1. 对每个关键词运行 exhaustive search。
+1. 并发对每个关键词运行 exhaustive search。
+   每个关键词会先抓第 1 页，再并发抓取剩余页；全局仍受 `SEARCH_MAX_REQUESTS_PER_SECOND` 控制。
 2. 按 PID 合并去重。
 3. 对全部抓到的帖子尽量补拉评论。
 4. 保存完整语料。
@@ -151,7 +174,7 @@ PID 扫描是并发的：任务会批量提交到线程池，`PID_FETCH_MAX_PARA
 
 - `/mode quick|deep`：切换“直接输入问题”时的默认模式
 - `/daily N`：扫描最近 `N` 个有效帖子候选并生成日报，例如 `/daily 4000`；直接输入 `/daily` 使用默认 `4000`
-- `/thorough kw1,kw2 | 问题`：先抓全关键词语料，再回答问题
+- `/thorough kw1,kw2 | 问题`：先抓全关键词语料，再回答问题；关键词也可用全角逗号 `，` 分隔，问题分隔符也支持全角竖线 `｜`
 - `/sessions`：查看历史会话列表
 - `/resume <session_id>`：恢复指定会话
 - `/history [session_id]`：查看当前或指定会话内容
@@ -228,6 +251,8 @@ DAILY_DIGEST_TOP_POSTS = 12
 
 THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD = -1
 THOROUGH_SEARCH_MAX_CONTEXT_POSTS = 40
+THOROUGH_SEARCH_MAX_PARALLEL = 6
+THOROUGH_SEARCH_PAGE_MAX_PARALLEL = 10
 ```
 
 ## 项目结构
@@ -238,6 +263,7 @@ pku-treehole-search-agent/
 ├── agent.md
 ├── client.py
 ├── config.py
+├── local_web_server.py
 ├── README.md
 ├── data/
 │   ├── cache/
@@ -247,7 +273,12 @@ pku-treehole-search-agent/
 │   ├── pid_post_cache/
 │   ├── sessions/
 │   ├── task_memory/
-│   └── thorough_search/
+│   ├── thorough_search/
+│   └── web_ui/
+├── frontend/
+│   ├── app.js
+│   ├── index.html
+│   └── styles.css
 └── email_bot/
 ```
 
