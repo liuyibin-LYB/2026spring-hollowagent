@@ -7,7 +7,6 @@ Auto keyword extraction with staged retrieval (multi-turn capable)
 
 import json
 import os
-import random
 import re
 import difflib
 import hashlib
@@ -49,6 +48,7 @@ DAILY_DIGEST_DIR = os.path.join(PROJECT_DIR, "data", "daily_digest")
 PID_POST_CACHE_DIR = os.path.join(PROJECT_DIR, "data", "pid_post_cache")
 COMMENT_CACHE_DIR = os.path.join(PROJECT_DIR, "data", "comment_cache")
 LATEST_PID_STATE_FILE = os.path.join(PROJECT_DIR, "data", "latest_pid_state.json")
+PID_POST_CACHE_COMMENT_PREVIEW_VERSION = 2
 
 # Conversation history persistence file
 CONVERSATION_FILE = os.path.join(PROJECT_DIR, "data", "conversation_history.json")
@@ -63,64 +63,74 @@ PASSWORD = _cfg.PASSWORD
 LLM_API_KEY = _cfg.LLM_API_KEY
 LLM_API_BASE = _cfg.LLM_API_BASE
 LLM_MODEL = _cfg.LLM_MODEL
-LLM_CHAT_COMPLETIONS_PATH = getattr(_cfg, "LLM_CHAT_COMPLETIONS_PATH", "/chat/completions")
-LLM_EXTRA_HEADERS = getattr(_cfg, "LLM_EXTRA_HEADERS", {})
-LLM_EXTRA_BODY = getattr(_cfg, "LLM_EXTRA_BODY", {})
-LLM_ENABLE_PARALLEL_TOOL_CALLS = getattr(_cfg, "LLM_ENABLE_PARALLEL_TOOL_CALLS", True)
-LLM_REASONING_EFFORT = getattr(_cfg, "LLM_REASONING_EFFORT", None)
-LLM_THINKING_TYPE = getattr(_cfg, "LLM_THINKING_TYPE", "auto")
+LLM_CHAT_COMPLETIONS_PATH = _cfg.LLM_CHAT_COMPLETIONS_PATH
+LLM_EXTRA_HEADERS = _cfg.LLM_EXTRA_HEADERS
+LLM_EXTRA_BODY = _cfg.LLM_EXTRA_BODY
+LLM_ENABLE_PARALLEL_TOOL_CALLS = _cfg.LLM_ENABLE_PARALLEL_TOOL_CALLS
+LLM_REASONING_EFFORT = _cfg.LLM_REASONING_EFFORT
+LLM_THINKING_TYPE = _cfg.LLM_THINKING_TYPE
 
-MAX_SEARCH_RESULTS = _cfg.MAX_SEARCH_RESULTS
-MAX_CONTEXT_POSTS = _cfg.MAX_CONTEXT_POSTS
-MAX_COMMENTS_PER_POST = _cfg.MAX_COMMENTS_PER_POST
+DEFAULT_SEARCH_RESULTS_PER_CALL = _cfg.DEFAULT_SEARCH_RESULTS_PER_CALL
+DEFAULT_COMMENT_FETCH_POSTS = _cfg.DEFAULT_COMMENT_FETCH_POSTS
+DEFAULT_COMMENTS_PER_POST = _cfg.DEFAULT_COMMENTS_PER_POST
 
 TEMPERATURE = _cfg.TEMPERATURE
 MAX_RESPONSE_TOKENS = _cfg.MAX_RESPONSE_TOKENS
 
-SEARCH_DELAY_MIN = _cfg.SEARCH_DELAY_MIN
-SEARCH_DELAY_MAX = _cfg.SEARCH_DELAY_MAX
-
 ENABLE_CACHE = _cfg.ENABLE_CACHE
 CACHE_DIR = _cfg.CACHE_DIR
-CACHE_EXPIRATION = getattr(_cfg, "CACHE_EXPIRATION", 7 * 24 * 3600)
+CACHE_EXPIRATION = _cfg.CACHE_EXPIRATION
 
-# Optional settings with backward-compatible defaults
-SEARCH_PAGE_LIMIT = getattr(_cfg, "SEARCH_PAGE_LIMIT", 30)
-SEARCH_COMMENT_LIMIT = getattr(_cfg, "SEARCH_COMMENT_LIMIT", 10)
-INCLUDE_IMAGE_POSTS = getattr(_cfg, "INCLUDE_IMAGE_POSTS", True)
-MAX_COMMENT_FETCH_POSTS = getattr(_cfg, "MAX_COMMENT_FETCH_POSTS", 6)
-COMMENT_FETCH_MAX_PARALLEL = getattr(_cfg, "COMMENT_FETCH_MAX_PARALLEL", 10)
-COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "COMMENT_FETCH_MAX_REQUESTS_PER_SECOND", 20.0)
-PID_FETCH_MAX_PARALLEL = getattr(_cfg, "PID_FETCH_MAX_PARALLEL", 20)
-PID_FETCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "PID_FETCH_MAX_REQUESTS_PER_SECOND", 40.0)
-PID_POST_CACHE_EXPIRATION = getattr(_cfg, "PID_POST_CACHE_EXPIRATION", 7 * 24 * 3600)
-PID_MISS_CACHE_EXPIRATION = getattr(_cfg, "PID_MISS_CACHE_EXPIRATION", 30 * 60)
-COMMENT_CACHE_EXPIRATION = getattr(_cfg, "COMMENT_CACHE_EXPIRATION", 7 * 24 * 3600)
-LLM_RETRY_MAX_ATTEMPTS = getattr(_cfg, "LLM_RETRY_MAX_ATTEMPTS", 5)
-LLM_RETRY_SLEEP_SECONDS = getattr(_cfg, "LLM_RETRY_SLEEP_SECONDS", 5)
-SEARCH_MAX_REQUESTS_PER_SECOND = getattr(_cfg, "SEARCH_MAX_REQUESTS_PER_SECOND", PID_FETCH_MAX_REQUESTS_PER_SECOND)
-QUICK_QA_MAX_TURNS = getattr(_cfg, "QUICK_QA_MAX_TURNS", 5)
-QUICK_QA_MAX_TOOL_ROUNDS = getattr(_cfg, "QUICK_QA_MAX_TOOL_ROUNDS", 4)
-QUICK_QA_SEARCH_BUDGET = getattr(_cfg, "QUICK_QA_SEARCH_BUDGET", 12)
-DEEP_RESEARCH_MAX_TOOL_ROUNDS = getattr(_cfg, "DEEP_RESEARCH_MAX_TOOL_ROUNDS", 10)
-DEEP_RESEARCH_SEARCH_BUDGET = getattr(_cfg, "DEEP_RESEARCH_SEARCH_BUDGET", 30)
-RECENT_PID_SCAN_HINT = getattr(_cfg, "RECENT_PID_SCAN_HINT", 8000000)
-RECENT_PID_SCAN_STEP = getattr(_cfg, "RECENT_PID_SCAN_STEP", 5000)
-RECENT_PID_SCAN_MAX_PROBES = getattr(_cfg, "RECENT_PID_SCAN_MAX_PROBES", 1500)
-DAILY_DIGEST_RECENT_POSTS = getattr(_cfg, "DAILY_DIGEST_RECENT_POSTS", 4000)
-DAILY_DIGEST_TOP_POSTS = getattr(_cfg, "DAILY_DIGEST_TOP_POSTS", 12)
-THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD = getattr(_cfg, "THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD", -1)
-THOROUGH_SEARCH_MAX_CONTEXT_POSTS = getattr(_cfg, "THOROUGH_SEARCH_MAX_CONTEXT_POSTS", max(MAX_CONTEXT_POSTS, 30))
-THOROUGH_SEARCH_MAX_PARALLEL = getattr(_cfg, "THOROUGH_SEARCH_MAX_PARALLEL", 6)
-THOROUGH_SEARCH_PAGE_MAX_PARALLEL = getattr(_cfg, "THOROUGH_SEARCH_PAGE_MAX_PARALLEL", 10)
-SESSION_RECENT_TURNS = getattr(_cfg, "SESSION_RECENT_TURNS", 5)
-SESSION_CONTEXT_MAX_POSTS = getattr(_cfg, "SESSION_CONTEXT_MAX_POSTS", max(MAX_CONTEXT_POSTS, 40))
+SEARCH_PAGE_LIMIT = _cfg.SEARCH_PAGE_LIMIT
+SEARCH_COMMENT_LIMIT = _cfg.SEARCH_COMMENT_LIMIT
+INCLUDE_IMAGE_POSTS = _cfg.INCLUDE_IMAGE_POSTS
+REQUEST_MAX_PARALLEL = max(1, int(_cfg.REQUEST_MAX_PARALLEL))
+REQUEST_MAX_REQUESTS_PER_SECOND = max(0.1, float(_cfg.REQUEST_MAX_REQUESTS_PER_SECOND))
+COMMENT_FETCH_MAX_PARALLEL = REQUEST_MAX_PARALLEL
+COMMENT_FETCH_MAX_REQUESTS_PER_SECOND = REQUEST_MAX_REQUESTS_PER_SECOND
+PID_FETCH_MAX_PARALLEL = REQUEST_MAX_PARALLEL
+PID_FETCH_MAX_REQUESTS_PER_SECOND = REQUEST_MAX_REQUESTS_PER_SECOND
+PID_POST_CACHE_EXPIRATION = _cfg.PID_POST_CACHE_EXPIRATION
+PID_MISS_CACHE_EXPIRATION = _cfg.PID_MISS_CACHE_EXPIRATION
+COMMENT_CACHE_EXPIRATION = _cfg.COMMENT_CACHE_EXPIRATION
+LLM_RETRY_MAX_ATTEMPTS = _cfg.LLM_RETRY_MAX_ATTEMPTS
+LLM_RETRY_SLEEP_SECONDS = _cfg.LLM_RETRY_SLEEP_SECONDS
+SEARCH_MAX_REQUESTS_PER_SECOND = REQUEST_MAX_REQUESTS_PER_SECOND
+QUICK_QA_MAX_TURNS = _cfg.QUICK_QA_MAX_TURNS
+QUICK_QA_MAX_TOOL_ROUNDS = _cfg.QUICK_QA_MAX_TOOL_ROUNDS
+QUICK_QA_SEARCH_BUDGET = _cfg.QUICK_QA_SEARCH_BUDGET
+QUICK_QA_SEARCH_RESULTS_PER_CALL = _cfg.QUICK_QA_SEARCH_RESULTS_PER_CALL
+QUICK_QA_CONTEXT_POST_LIMIT = _cfg.QUICK_QA_CONTEXT_POST_LIMIT
+QUICK_QA_COMMENT_FETCH_POSTS = _cfg.QUICK_QA_COMMENT_FETCH_POSTS
+QUICK_QA_COMMENTS_PER_POST = _cfg.QUICK_QA_COMMENTS_PER_POST
+DEEP_RESEARCH_MAX_TOOL_ROUNDS = _cfg.DEEP_RESEARCH_MAX_TOOL_ROUNDS
+DEEP_RESEARCH_SEARCH_BUDGET = _cfg.DEEP_RESEARCH_SEARCH_BUDGET
+DEEP_RESEARCH_SEARCH_RESULTS_PER_CALL = _cfg.DEEP_RESEARCH_SEARCH_RESULTS_PER_CALL
+DEEP_RESEARCH_CONTEXT_POST_LIMIT = _cfg.DEEP_RESEARCH_CONTEXT_POST_LIMIT
+DEEP_RESEARCH_COMMENT_FETCH_POSTS = _cfg.DEEP_RESEARCH_COMMENT_FETCH_POSTS
+DEEP_RESEARCH_COMMENTS_PER_POST = _cfg.DEEP_RESEARCH_COMMENTS_PER_POST
+RECENT_PID_SCAN_HINT = _cfg.RECENT_PID_SCAN_HINT
+RECENT_PID_SCAN_STEP = _cfg.RECENT_PID_SCAN_STEP
+RECENT_PID_SCAN_MAX_PROBES = _cfg.RECENT_PID_SCAN_MAX_PROBES
+DAILY_DIGEST_RECENT_POSTS = _cfg.DAILY_DIGEST_RECENT_POSTS
+DAILY_DIGEST_TOP_POSTS = _cfg.DAILY_DIGEST_TOP_POSTS
+DAILY_DIGEST_COMMENTS_PER_POST = _cfg.DAILY_DIGEST_COMMENTS_PER_POST
+THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD = _cfg.THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD
+THOROUGH_SEARCH_MAX_CONTEXT_POSTS = _cfg.THOROUGH_SEARCH_MAX_CONTEXT_POSTS
+THOROUGH_SEARCH_CONTEXT_COMMENTS_PER_POST = _cfg.THOROUGH_SEARCH_CONTEXT_COMMENTS_PER_POST
+THOROUGH_SEARCH_MAX_PARALLEL = REQUEST_MAX_PARALLEL
+THOROUGH_SEARCH_PAGE_MAX_PARALLEL = REQUEST_MAX_PARALLEL
+SESSION_RECENT_TURNS = _cfg.SESSION_RECENT_TURNS
+SESSION_CONTEXT_MAX_POSTS = _cfg.SESSION_CONTEXT_MAX_POSTS
 
-# Backward-compatible legacy knobs (still used in docs/prompts as soft hints)
-BROAD_SEARCH_MIN = getattr(_cfg, "BROAD_SEARCH_MIN", 10)
-BROAD_SEARCH_MAX = getattr(_cfg, "BROAD_SEARCH_MAX", 20)
-FOCUSED_SEARCH_MIN = getattr(_cfg, "FOCUSED_SEARCH_MIN", 5)
-FOCUSED_SEARCH_MAX = getattr(_cfg, "FOCUSED_SEARCH_MAX", 10)
+QUICK_QA_BROAD_SEARCH_HINT_MIN = _cfg.QUICK_QA_BROAD_SEARCH_HINT_MIN
+QUICK_QA_BROAD_SEARCH_HINT_MAX = _cfg.QUICK_QA_BROAD_SEARCH_HINT_MAX
+QUICK_QA_FOCUSED_SEARCH_HINT_MIN = _cfg.QUICK_QA_FOCUSED_SEARCH_HINT_MIN
+QUICK_QA_FOCUSED_SEARCH_HINT_MAX = _cfg.QUICK_QA_FOCUSED_SEARCH_HINT_MAX
+DEEP_RESEARCH_BROAD_SEARCH_HINT_MIN = _cfg.DEEP_RESEARCH_BROAD_SEARCH_HINT_MIN
+DEEP_RESEARCH_BROAD_SEARCH_HINT_MAX = _cfg.DEEP_RESEARCH_BROAD_SEARCH_HINT_MAX
+DEEP_RESEARCH_FOCUSED_SEARCH_HINT_MIN = _cfg.DEEP_RESEARCH_FOCUSED_SEARCH_HINT_MIN
+DEEP_RESEARCH_FOCUSED_SEARCH_HINT_MAX = _cfg.DEEP_RESEARCH_FOCUSED_SEARCH_HINT_MAX
 
 # Normalize cache path to an absolute path under project root when configured as relative.
 if not os.path.isabs(CACHE_DIR):
@@ -296,7 +306,7 @@ class TreeholeRAGAgent:
         }
     }
 
-    # System prompt shared by mode_auto_search and multi-turn conversation
+    # System prompt shared by quick Q&A and deep research conversations.
     _AUTO_SEARCH_SYSTEM_PROMPT = (
         "你是一个北大树洞问答助手。你有三个工具：\n"
         "1) search_treehole: 关键词搜索帖子\n"
@@ -338,10 +348,14 @@ class TreeholeRAGAgent:
             "max_turns": QUICK_QA_MAX_TURNS,
             "max_tool_rounds": QUICK_QA_MAX_TOOL_ROUNDS,
             "search_budget": QUICK_QA_SEARCH_BUDGET,
-            "search_results_per_call": min(MAX_SEARCH_RESULTS, 25),
-            "context_post_limit": min(SESSION_CONTEXT_MAX_POSTS, max(12, MAX_CONTEXT_POSTS)),
-            "comment_fetch_posts": min(MAX_COMMENT_FETCH_POSTS, max(6, MAX_COMMENT_FETCH_POSTS)),
-            "comment_limit": min(MAX_COMMENTS_PER_POST if MAX_COMMENTS_PER_POST > 0 else 8, 12) if MAX_COMMENTS_PER_POST != -1 else 12,
+            "search_results_per_call": QUICK_QA_SEARCH_RESULTS_PER_CALL,
+            "context_post_limit": QUICK_QA_CONTEXT_POST_LIMIT,
+            "comment_fetch_posts": QUICK_QA_COMMENT_FETCH_POSTS,
+            "comment_limit": QUICK_QA_COMMENTS_PER_POST,
+            "broad_search_hint_min": QUICK_QA_BROAD_SEARCH_HINT_MIN,
+            "broad_search_hint_max": QUICK_QA_BROAD_SEARCH_HINT_MAX,
+            "focused_search_hint_min": QUICK_QA_FOCUSED_SEARCH_HINT_MIN,
+            "focused_search_hint_max": QUICK_QA_FOCUSED_SEARCH_HINT_MAX,
             "query_style": "快速检索，优先解决当前问题，适合连续追问，默认控制在五轮以内。",
         },
         "deep": {
@@ -350,10 +364,14 @@ class TreeholeRAGAgent:
             "max_turns": 999,
             "max_tool_rounds": DEEP_RESEARCH_MAX_TOOL_ROUNDS,
             "search_budget": DEEP_RESEARCH_SEARCH_BUDGET,
-            "search_results_per_call": max(MAX_SEARCH_RESULTS, 40),
-            "context_post_limit": max(SESSION_CONTEXT_MAX_POSTS, MAX_CONTEXT_POSTS),
-            "comment_fetch_posts": max(MAX_COMMENT_FETCH_POSTS, 12),
-            "comment_limit": MAX_COMMENTS_PER_POST,
+            "search_results_per_call": DEEP_RESEARCH_SEARCH_RESULTS_PER_CALL,
+            "context_post_limit": DEEP_RESEARCH_CONTEXT_POST_LIMIT,
+            "comment_fetch_posts": DEEP_RESEARCH_COMMENT_FETCH_POSTS,
+            "comment_limit": DEEP_RESEARCH_COMMENTS_PER_POST,
+            "broad_search_hint_min": DEEP_RESEARCH_BROAD_SEARCH_HINT_MIN,
+            "broad_search_hint_max": DEEP_RESEARCH_BROAD_SEARCH_HINT_MAX,
+            "focused_search_hint_min": DEEP_RESEARCH_FOCUSED_SEARCH_HINT_MIN,
+            "focused_search_hint_max": DEEP_RESEARCH_FOCUSED_SEARCH_HINT_MAX,
             "query_style": "在预算内渐进式研究，可先广泛摸底，再逐步聚焦，并自主决定研究方向。",
         },
     }
@@ -416,6 +434,7 @@ class TreeholeRAGAgent:
         self._comment_metrics_lock = threading.Lock()
         self._comment_fetch_stats: Dict[str, Any] = self._new_comment_fetch_stats()
         self._post_cache: Dict[int, Dict[str, Any]] = {}
+        self._post_cache_meta: Dict[int, Dict[str, Any]] = {}
         self._post_miss_cache: Dict[int, float] = {}
 
         # Load persistent agent knowledge and ensure data directories exist.
@@ -437,20 +456,14 @@ class TreeholeRAGAgent:
         if ENABLE_CACHE:
             os.makedirs(CACHE_DIR, exist_ok=True)
 
-        print(f"{AGENT_PREFIX}✓ 树洞 RAG Agent 初始化成功")
+        print(f"{AGENT_PREFIX}Treehole RAG Agent initialized")
 
     def _configure_http_pool(self) -> None:
         """Align requests' connection pool with our worker concurrency."""
         session = getattr(self.client, "session", None)
         if session is None:
             return
-        pool_size = max(
-            10,
-            int(COMMENT_FETCH_MAX_PARALLEL),
-            int(PID_FETCH_MAX_PARALLEL),
-            int(SEARCH_MAX_REQUESTS_PER_SECOND),
-            int(THOROUGH_SEARCH_MAX_PARALLEL) * int(THOROUGH_SEARCH_PAGE_MAX_PARALLEL),
-        )
+        pool_size = max(1, int(REQUEST_MAX_PARALLEL))
         adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, pool_block=True)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
@@ -465,28 +478,6 @@ class TreeholeRAGAgent:
         with self._seq_lock:
             self._tool_request_seq += 1
             return self._tool_request_seq
-
-    # ------------------------------------------------------------------ #
-    #                        Random delay helpers                         #
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _human_delay(min_s: float, max_s: float, label: str = "") -> float:
-        """Sleep for a random duration to simulate human browsing.
-
-        Args:
-            min_s: Minimum delay in seconds.
-            max_s: Maximum delay in seconds.
-            label: Optional label for debug output.
-
-        Returns:
-            The actual delay applied (seconds).
-        """
-        delay = random.uniform(min_s, max_s)
-        if label:
-            print(f"{AGENT_PREFIX}⏳ {label}: 等待 {delay:.2f}s")
-        time.sleep(delay)
-        return delay
 
     @staticmethod
     def _format_unix_timestamp(ts: Optional[int]) -> str:
@@ -517,6 +508,25 @@ class TreeholeRAGAgent:
         return post
 
     @staticmethod
+    def _inline_comment_preview_count(post: Dict[str, Any]) -> int:
+        comments = post.get("comments") or post.get("comment_list") or []
+        if not isinstance(comments, list):
+            return 0
+        return sum(1 for comment in comments if isinstance(comment, dict))
+
+    def _needs_inline_comment_preview_refresh(self, pid: int, post: Dict[str, Any], include_comments: bool) -> bool:
+        if include_comments:
+            return False
+        reply_hint = self._nonnegative_int(
+            post.get("comment_total", post.get("reply_count", post.get("reply", 0))),
+            0,
+        )
+        if reply_hint <= 0 or self._inline_comment_preview_count(post) > 0:
+            return False
+        meta = self._post_cache_meta.get(int(pid), {})
+        return int(meta.get("comment_preview_version") or 0) < PID_POST_CACHE_COMMENT_PREVIEW_VERSION
+
+    @staticmethod
     def _resolve_search_comment_limit() -> int:
         """Resolve comment_limit sent to search API from config value."""
         if SEARCH_COMMENT_LIMIT == -1:
@@ -533,7 +543,7 @@ class TreeholeRAGAgent:
             with open(AGENT_KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
                 content = f.read().strip()
             if content:
-                print(f"{AGENT_PREFIX}✓ 已加载 agent.md 经验库")
+                print(f"{AGENT_PREFIX}Loaded agent.md knowledge")
             return content
         except Exception as e:
             print(f"{AGENT_PREFIX}加载 agent.md 失败: {e}")
@@ -887,7 +897,7 @@ class TreeholeRAGAgent:
         try:
             with open(self._task_memory_file, "w", encoding="utf-8") as f:
                 f.write(header)
-            print(f"{AGENT_PREFIX}✓ 已创建任务 memory: {self._task_memory_file}")
+            print(f"{AGENT_PREFIX}Created task memory: {self._task_memory_file}")
         except Exception as e:
             print(f"{AGENT_PREFIX}创建任务 memory 失败: {e}")
             self._task_memory_file = None
@@ -933,13 +943,14 @@ class TreeholeRAGAgent:
         })
         self._last_memory_snapshot_hash = snapshot_hash
 
-    def _build_auto_search_system_prompt(self) -> str:
+    def _build_auto_search_system_prompt(self, profile: str) -> str:
         """Build dynamic auto-search system prompt with agent/task memories."""
+        profile_cfg = self.MODE_PROFILES[profile]
         base = self._AUTO_SEARCH_SYSTEM_PROMPT.format(
-            broad_min=BROAD_SEARCH_MIN,
-            broad_max=BROAD_SEARCH_MAX,
-            focused_min=FOCUSED_SEARCH_MIN,
-            focused_max=FOCUSED_SEARCH_MAX,
+            broad_min=profile_cfg["broad_search_hint_min"],
+            broad_max=profile_cfg["broad_search_hint_max"],
+            focused_min=profile_cfg["focused_search_hint_min"],
+            focused_max=profile_cfg["focused_search_hint_max"],
         )
         sections = [base]
 
@@ -980,6 +991,7 @@ class TreeholeRAGAgent:
             return False
 
         cached_at = float(payload.get("cached_at") or 0.0)
+        comment_preview_version = int(payload.get("comment_preview_version") or 0)
         found = bool(payload.get("found"))
         ttl = PID_POST_CACHE_EXPIRATION if found else PID_MISS_CACHE_EXPIRATION
         if ttl > 0 and cached_at > 0 and now - cached_at > ttl:
@@ -987,6 +999,9 @@ class TreeholeRAGAgent:
 
         if not found:
             self._post_miss_cache[pid] = cached_at or now
+            self._post_cache_meta[pid] = {
+                "comment_preview_version": comment_preview_version,
+            }
             return None
 
         post = payload.get("post")
@@ -994,14 +1009,19 @@ class TreeholeRAGAgent:
             return False
         normalized = self._normalize_post_metadata(dict(post))
         self._post_cache[pid] = dict(normalized)
+        self._post_cache_meta[pid] = {
+            "comment_preview_version": comment_preview_version,
+        }
         return normalized
 
     def _save_pid_post_cache(self, pid: int, post: Optional[Dict[str, Any]]) -> None:
         """Persist one PID lookup result for later daily scans."""
+        comment_preview_version = PID_POST_CACHE_COMMENT_PREVIEW_VERSION if post else 0
         payload = {
             "pid": int(pid),
             "found": bool(post),
             "post": post if post else None,
+            "comment_preview_version": comment_preview_version,
             "cached_at": time.time(),
             "updated_at": self._now_str(),
         }
@@ -1010,6 +1030,9 @@ class TreeholeRAGAgent:
             self._post_cache[int(pid)] = dict(post)
         else:
             self._post_miss_cache[int(pid)] = payload["cached_at"]
+        self._post_cache_meta[int(pid)] = {
+            "comment_preview_version": comment_preview_version,
+        }
 
     def _comment_cache_file(self, pid: int) -> str:
         return os.path.join(COMMENT_CACHE_DIR, f"{int(pid)}.json")
@@ -1043,7 +1066,7 @@ class TreeholeRAGAgent:
         self,
         pid: int,
         include_comments: bool = False,
-        max_comments: int = MAX_COMMENTS_PER_POST,
+        max_comments: int = DEFAULT_COMMENTS_PER_POST,
         quiet: bool = False,
         use_cache: bool = True,
     ) -> Optional[Dict[str, Any]]:
@@ -1056,13 +1079,19 @@ class TreeholeRAGAgent:
         cached = self._load_pid_post_cache(pid) if use_cache else False
         if isinstance(cached, dict):
             cached_post = dict(cached)
-            if include_comments:
-                cached_post["comments"] = self._load_comments_for_post(cached_post, max_comments)
-            if not quiet:
-                self._emit_info(
-                    f"Tool#{tool_id} get_post_by_pid 命中缓存: pid={pid}, 耗时 {time.time() - start_ts:.2f}s"
-                )
-            return cached_post
+            if self._needs_inline_comment_preview_refresh(pid, cached_post, include_comments):
+                if not quiet:
+                    self._emit_info(
+                        f"Tool#{tool_id} get_post_by_pid cache lacks inline comment preview: pid={pid}"
+                    )
+            else:
+                if include_comments:
+                    cached_post["comments"] = self._load_comments_for_post(cached_post, max_comments)
+                if not quiet:
+                    self._emit_info(
+                        f"Tool#{tool_id} get_post_by_pid 命中缓存: pid={pid}, 耗时 {time.time() - start_ts:.2f}s"
+                    )
+                return cached_post
         if cached is None:
             if not quiet:
                 self._emit_info(
@@ -1097,7 +1126,7 @@ class TreeholeRAGAgent:
     def get_comments_by_pid(
         self,
         pid: int,
-        max_comments: int = MAX_COMMENTS_PER_POST,
+        max_comments: int = DEFAULT_COMMENTS_PER_POST,
         sort: str = "asc",
     ) -> List[Dict[str, Any]]:
         """Fetch comments by pid directly with pagination and global rate limit."""
@@ -1580,7 +1609,7 @@ class TreeholeRAGAgent:
             for post in normalized_posts
             if not self._post_has_sufficient_comments(post, max_comments)
         ]
-        effective_selected_limit = selected_limit if selected_limit is not None else MAX_COMMENT_FETCH_POSTS
+        effective_selected_limit = selected_limit if selected_limit is not None else DEFAULT_COMMENT_FETCH_POSTS
         effective_selected_limit = max(0, min(effective_selected_limit, len(fetch_candidates)))
         if fetch_candidates and effective_selected_limit > 0:
             selected_pids = self._select_posts_for_comment_fetch(
@@ -1666,6 +1695,71 @@ class TreeholeRAGAgent:
 
         return hydrated
 
+    def _limit_inline_comment_preview(self, post: Dict[str, Any], max_comments: int) -> Dict[str, Any]:
+        limited = dict(post)
+        comments = [
+            self._normalize_comment_metadata(c)
+            for c in (limited.get("comments") or limited.get("comment_list") or [])
+            if isinstance(c, dict)
+        ]
+        if max_comments >= 0:
+            comments = comments[:max_comments]
+        limited["comments"] = comments
+        limited["comment_list"] = comments
+        return limited
+
+    def _hydrate_posts_with_getpost_preview(
+        self,
+        posts: List[Dict[str, Any]],
+        max_comments: int = SEARCH_COMMENT_LIMIT,
+    ) -> List[Dict[str, Any]]:
+        """Refresh posts through getpost preview only; never page through comment API."""
+        normalized_posts = [self._normalize_post_metadata(dict(post)) for post in posts]
+        if not normalized_posts:
+            return []
+
+        max_workers = max(1, min(REQUEST_MAX_PARALLEL, len(normalized_posts)))
+        self._emit_info(
+            f"getpost 预览补齐: {len(normalized_posts)} 帖, 并发 {max_workers}, "
+            f"提交速率上限 {PID_FETCH_MAX_REQUESTS_PER_SECOND:.2f} req/s"
+        )
+
+        fetched_by_pid: Dict[int, Dict[str, Any]] = {}
+
+        def fetch_preview(post: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]]]:
+            pid = self._int_or_default(post.get("pid"), 0)
+            if pid <= 0:
+                return 0, None
+            fetched = self.get_post_by_pid(
+                pid,
+                include_comments=False,
+                max_comments=max_comments,
+                quiet=True,
+            )
+            return pid, fetched
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_pid = {
+                executor.submit(fetch_preview, post): self._int_or_default(post.get("pid"), 0)
+                for post in normalized_posts
+                if self._int_or_default(post.get("pid"), 0) > 0
+            }
+            for future in as_completed(future_to_pid):
+                pid = future_to_pid[future]
+                try:
+                    fetched_pid, fetched = future.result()
+                    if fetched_pid and fetched:
+                        fetched_by_pid[fetched_pid] = fetched
+                except Exception as e:
+                    self._emit_info(f"警告: getpost 预览补齐失败 pid={pid}, error={e}")
+
+        hydrated: List[Dict[str, Any]] = []
+        for post in normalized_posts:
+            pid = self._int_or_default(post.get("pid"), 0)
+            hydrated.append(self._limit_inline_comment_preview(fetched_by_pid.get(pid) or post, max_comments))
+
+        return hydrated
+
     # ------------------------------------------------------------------ #
     #                        Treehole search                              #
     # ------------------------------------------------------------------ #
@@ -1673,7 +1767,7 @@ class TreeholeRAGAgent:
     def search_treehole(
         self,
         keyword: str,
-        max_results: int = MAX_SEARCH_RESULTS,
+        max_results: int = DEFAULT_SEARCH_RESULTS_PER_CALL,
         use_cache: bool = ENABLE_CACHE
     ) -> List[Dict[str, Any]]:
         """
@@ -1683,7 +1777,7 @@ class TreeholeRAGAgent:
         if normalized_max_results == 0:
             return []
         if normalized_max_results is None:
-            normalized_max_results = MAX_SEARCH_RESULTS
+            normalized_max_results = DEFAULT_SEARCH_RESULTS_PER_CALL
 
         # Check cache first
         if use_cache:
@@ -1714,10 +1808,8 @@ class TreeholeRAGAgent:
                     normalized_posts = [post for post in normalized_posts if not post.get("has_image")]
                 return normalized_posts
 
-            def fetch_search_page(page_no: int, request_limit: int, apply_initial_delay: bool = False) -> Dict[str, Any]:
+            def fetch_search_page(page_no: int, request_limit: int) -> Dict[str, Any]:
                 self._search_rate_limiter.acquire()
-                if apply_initial_delay and (SEARCH_DELAY_MAX > 0 or SEARCH_DELAY_MIN > 0):
-                    self._human_delay(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX, f"搜索请求 {keyword}")
 
                 search_result = self.client.search_posts(
                     keyword,
@@ -1754,7 +1846,7 @@ class TreeholeRAGAgent:
                     f"页并发 {max(1, int(THOROUGH_SEARCH_PAGE_MAX_PARALLEL))}"
                 )
 
-                first_page = fetch_search_page(1, page_limit, apply_initial_delay=True)
+                first_page = fetch_search_page(1, page_limit)
                 if first_page.get("error"):
                     self._emit_info(f"搜索失败: {first_page['error']}")
                 elif not first_page.get("raw_count"):
@@ -1832,7 +1924,7 @@ class TreeholeRAGAgent:
                 if unlimited:
                     break
                 request_limit = page_limit if unlimited else min(page_limit, normalized_max_results - len(all_posts))
-                page_result = fetch_search_page(page, request_limit, apply_initial_delay=page == 1)
+                page_result = fetch_search_page(page, request_limit)
 
                 if page_result.get("error"):
                     msg = f"搜索失败: {page_result['error']}"
@@ -2374,7 +2466,7 @@ class TreeholeRAGAgent:
     def _build_research_system_prompt(self, profile: str) -> str:
         profile_cfg = self.MODE_PROFILES[profile]
         return (
-            self._build_auto_search_system_prompt()
+            self._build_auto_search_system_prompt(profile)
             + "\n\n[当前模式]\n"
             + f"- 模式: {profile_cfg['label']}\n"
             + f"- 风格: {profile_cfg['query_style']}\n"
@@ -3008,7 +3100,7 @@ class TreeholeRAGAgent:
                 batch_no += 1
                 batch_start = time.time()
                 future_to_pid = {
-                    executor.submit(self.get_post_by_pid, candidate_pid, False, MAX_COMMENTS_PER_POST, True): candidate_pid
+                    executor.submit(self.get_post_by_pid, candidate_pid, False, DEFAULT_COMMENTS_PER_POST, True): candidate_pid
                     for candidate_pid in candidate_pids
                 }
                 batch_results: Dict[int, Dict[str, Any]] = {}
@@ -3088,13 +3180,13 @@ class TreeholeRAGAgent:
             latest_pid=latest_pid,
         )
         ranked_posts = sorted(recent_posts, key=self._score_daily_post, reverse=True)
-        top_posts = ranked_posts[:max(DAILY_DIGEST_TOP_POSTS, 1)]
+        top_posts = ranked_posts[:DAILY_DIGEST_TOP_POSTS]
         self._emit_info(
             f"每日候选 {len(recent_posts)} 帖，按收藏优先排序后取前 {len(top_posts)} 帖进入日报上下文"
         )
         hydrated_posts = self._hydrate_posts_for_context(
             top_posts,
-            max_comments=min(MAX_COMMENTS_PER_POST if MAX_COMMENTS_PER_POST > 0 else 10, 10) if MAX_COMMENTS_PER_POST != -1 else 10,
+            max_comments=DAILY_DIGEST_COMMENTS_PER_POST,
             selection_query="每日神帖 高质量 高收藏 收藏量优先 回复数仅辅助",
             context_post_limit=len(top_posts),
             selected_limit=len(top_posts),
@@ -3229,16 +3321,19 @@ class TreeholeRAGAgent:
             )
 
         all_posts = sorted(merged_posts.values(), key=lambda item: int(item.get("pid", 0) or 0), reverse=True)
-        self._emit_info(f"Thorough Search 开始全量补评论: 去重后 {len(all_posts)} 帖")
-        hydrated_posts = self._hydrate_all_posts_with_comments(all_posts, max_comments=-1)
-        self._emit_info(f"Thorough Search 评论补拉完成: {len(hydrated_posts)} 帖")
+        self._emit_info(f"Thorough Search 开始 getpost 预览补齐: 去重后 {len(all_posts)} 帖")
+        hydrated_posts = self._hydrate_posts_with_getpost_preview(all_posts, max_comments=SEARCH_COMMENT_LIMIT)
+        self._emit_info(f"Thorough Search getpost 预览补齐完成: {len(hydrated_posts)} 帖")
 
         corpus_json_path = os.path.join(run_dir, "corpus.json")
         corpus_md_path = os.path.join(run_dir, "corpus.md")
         corpus_index_path = os.path.join(run_dir, "corpus_index.md")
         self._emit_info("Thorough Search 正在保存语料文件...")
         save_json(hydrated_posts, corpus_json_path)
-        self._save_text_artifact(corpus_md_path, format_posts_batch(hydrated_posts, include_comments=True, max_comments=-1))
+        self._save_text_artifact(
+            corpus_md_path,
+            format_posts_batch(hydrated_posts, include_comments=True, max_comments=SEARCH_COMMENT_LIMIT),
+        )
         self._save_text_artifact(
             corpus_index_path,
             self._format_search_brief(
@@ -3258,15 +3353,13 @@ class TreeholeRAGAgent:
             selected_posts = self._rank_posts_for_query(
                 hydrated_posts,
                 query=question,
-                limit=max(THOROUGH_SEARCH_MAX_CONTEXT_POSTS, 20),
+                limit=THOROUGH_SEARCH_MAX_CONTEXT_POSTS,
             )
-            context_posts = self._hydrate_posts_for_context(
-                selected_posts,
-                min(MAX_COMMENTS_PER_POST if MAX_COMMENTS_PER_POST > 0 else 12, 12) if MAX_COMMENTS_PER_POST != -1 else 12,
-                selection_query=question,
-                context_post_limit=THOROUGH_SEARCH_MAX_CONTEXT_POSTS,
-                selected_limit=min(len(selected_posts), max(MAX_COMMENT_FETCH_POSTS, 12)),
-            )
+            context_comment_limit = THOROUGH_SEARCH_CONTEXT_COMMENTS_PER_POST
+            context_posts = [
+                self._limit_inline_comment_preview(post, context_comment_limit)
+                for post in selected_posts[:THOROUGH_SEARCH_MAX_CONTEXT_POSTS]
+            ]
             system_message = (
                 "你是北大树洞语料问答助手。你正在使用用户手工指定关键词抓下来的完整语料回答问题。"
                 "请优先引用 pid，并对证据不足处明确说明。"
@@ -3275,7 +3368,7 @@ class TreeholeRAGAgent:
                 f"关键词: {', '.join(unique_keywords)}\n"
                 f"问题: {question}\n\n"
                 f"以下是从大语料中筛出的高相关上下文：\n\n"
-                f"{format_posts_batch(context_posts, include_comments=True, max_comments=12)}"
+                f"{format_posts_batch(context_posts, include_comments=True, max_comments=context_comment_limit)}"
             )
             print("\n【Thorough Search 回答】\n")
             answer = self.call_llm(user_message=user_message, system_message=system_message, stream=True)
@@ -3297,7 +3390,7 @@ class TreeholeRAGAgent:
         }
 
     # ------------------------------------------------------------------ #
-    #              Public modes / backward-compatible wrappers            #
+    #                          Public modes                               #
     # ------------------------------------------------------------------ #
 
     def mode_quick_qa(self, user_question: str) -> Dict[str, Any]:
@@ -3307,14 +3400,6 @@ class TreeholeRAGAgent:
     def mode_deep_research(self, user_question: str) -> Dict[str, Any]:
         print_header("模式 3: Deep Research")
         return self._run_profiled_turn(user_question, profile="deep")
-
-    def mode_auto_search(self, user_question: str) -> Dict[str, Any]:
-        """Backward-compatible entrypoint."""
-        return self.mode_deep_research(user_question)
-
-    def mode_auto_search_multi_turn(self, user_question: str) -> Dict[str, Any]:
-        """Backward-compatible multi-turn entrypoint."""
-        return self.mode_quick_qa(user_question)
 
     def save_conversation(self):
         """Save current session to disk."""

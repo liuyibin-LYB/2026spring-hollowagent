@@ -14,6 +14,7 @@ from http.cookiejar import Cookie
 import requests
 
 DEFAULT_TREEHOLE_REQUEST_TIMEOUT = (10, 30)
+DEFAULT_POST_COMMENT_PREVIEW_LIMIT = 10
 
 
 def _load_default_timeout():
@@ -218,19 +219,72 @@ class TreeholeClient:
         response.raise_for_status()
         return response
 
-    def get_post(self, post_id):
+    @staticmethod
+    def _transform_post_one_response(result, post_id):
+        if not isinstance(result, dict):
+            return {"success": False, "data": None, "message": "Invalid response", "code": None}
+
+        if result.get("code") != 20000:
+            return {
+                "success": False,
+                "data": None,
+                "message": result.get("message") or result.get("msg") or "Post not available",
+                "code": result.get("code"),
+            }
+
+        data = result.get("data") or {}
+        hole = data.get("hole") if isinstance(data, dict) else None
+        if not isinstance(hole, dict):
+            return {
+                "success": False,
+                "data": None,
+                "message": "Malformed post response",
+                "code": result.get("code"),
+            }
+
+        comments = data.get("list") or []
+        if not isinstance(comments, list):
+            comments = []
+        post = dict(hole)
+        post["pid"] = post.get("pid") or int(post_id)
+        post["comments"] = comments
+        post["comment_list"] = comments
+        post["comment_total"] = data.get("total", post.get("reply", len(comments)))
+        return {"success": True, "data": post, "code": result.get("code"), "message": result.get("message")}
+
+    def _get_post_legacy(self, post_id):
+        response = self._request("GET", f"https://treehole.pku.edu.cn/api/pku/{post_id}")
+        response.raise_for_status()
+        return response.json()
+
+    def get_post(self, post_id, comment_limit=DEFAULT_POST_COMMENT_PREVIEW_LIMIT):
         """
-        Get a post by its ID.
+        Get a post by its ID, including the server-provided comment preview.
 
         Args:
             post_id (int): The post ID.
+            comment_limit (int): Number of inline preview comments to request.
 
         Returns:
             dict: JSON response containing the post data.
         """
-        response = self._request("GET", f"https://treehole.pku.edu.cn/api/pku/{post_id}")
+        try:
+            normalized_limit = max(1, min(100, int(comment_limit or DEFAULT_POST_COMMENT_PREVIEW_LIMIT)))
+        except Exception:
+            normalized_limit = DEFAULT_POST_COMMENT_PREVIEW_LIMIT
+
+        response = self._request(
+            "GET",
+            "https://treehole.pku.edu.cn/chapi/api/v3/hole/one",
+            params={"pid": int(post_id), "limit": normalized_limit},
+        )
         response.raise_for_status()
-        return response.json()
+        result = response.json()
+        transformed = self._transform_post_one_response(result, post_id)
+        if transformed.get("success") or transformed.get("code") is not None:
+            return transformed
+
+        return self._get_post_legacy(post_id)
 
     def get_comment(self, post_id, page=1, limit=15, sort="asc"):
         """
