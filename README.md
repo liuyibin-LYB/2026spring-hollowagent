@@ -123,9 +123,9 @@ PID 扫描是并发的：任务会批量提交到线程池，`REQUEST_MAX_PARALL
 流程：
 
 1. 并发对每个关键词运行 exhaustive search。
-   每个关键词会先抓第 1 页，再并发抓取剩余页；全局仍受 `REQUEST_MAX_REQUESTS_PER_SECOND` 控制。
+   每个关键词固定按 `SEARCH_PAGE_LIMIT` 连续分页批量抓取；接口返回的 `total`/`last_page` 只作提示，不作为停止条件。抓取会在空页、短页、重复页或达到 `THOROUGH_SEARCH_MAX_RESULTS_PER_KEYWORD` 时停止；全局仍受 `REQUEST_MAX_REQUESTS_PER_SECOND` 控制。
 2. 按 PID 合并去重。
-3. 对全部抓到的帖子用 getpost 自带评论预览补齐，不做全量分页补评论。
+3. 直接使用 search API 自带的评论预览，不对全部帖子额外 getpost。
 4. 保存完整语料。
 5. 如果用户同时给了问题，再从完整语料中排序筛选上下文，让 LLM 回答。
 
@@ -143,7 +143,7 @@ PID 扫描是并发的：任务会批量提交到线程池，`REQUEST_MAX_PARALL
 | 每日神贴 | 最新 PID 往回扫描得到的有效候选 | 排名前 `DAILY_DIGEST_TOP_POSTS` 的帖子都会补拉 | 代码按收藏优先排序，不让回复数主导 | `daily_hot_posts.json/md` 中的帖子 |
 | 日常 Q&A | 当前 session 缓存，加上本轮工具搜索的新帖子 | LLM 从候选中选 `comment_fetch_posts` 个帖子补拉 | LLM 在工具轮中决定搜索、抓单帖、抓评论；回答前再次选择补评论帖子 | 当前问题排序后的 `context_post_limit` 个帖子 |
 | Deep Research | 同日常 Q&A，但预算更大 | 同日常 Q&A，上限更高 | 同日常 Q&A | 同日常 Q&A |
-| Thorough Search | 用户指定关键词下的全部搜索结果 | 通过 getpost 自带评论预览补齐，不再全量分页补评论 | 若给了问题，代码先按问题排序，再让 LLM 基于筛出的上下文回答 | `answer.md` 对应的筛选上下文 |
+| Thorough Search | 用户指定关键词下的全部搜索结果 | 使用 search API 自带评论预览，不对全部帖子额外 getpost | 若给了问题，代码先按问题排序，再让 LLM 基于筛出的上下文回答 | `answer.md` 对应的筛选上下文 |
 
 运行时会打印：
 

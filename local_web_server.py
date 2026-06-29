@@ -3,6 +3,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import pickle
 import re
 import sqlite3
 import threading
@@ -27,6 +28,9 @@ CHAT_HISTORY_FILE = WEB_UI_DIR / "chat_history.json"
 POST_METADATA_FILE = WEB_UI_DIR / "post_metadata.json"
 INDEX_DB_FILE = WEB_UI_DIR / "local_index.sqlite3"
 INDEX_CACHE_VERSION = 2
+SNAPSHOT_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
+SNAPSHOT_FILE_PREFIX = f"local_index_snapshot_v{INDEX_CACHE_VERSION}_"
+SNAPSHOT_FILE_SUFFIX = ".pkl"
 FAST_REINDEX_PID_LIMIT = 12000
 PID_IMPORT_MAX_ITEMS = 500
 PID_IMPORT_COMMENT_PREVIEW_LIMIT = 5
@@ -356,6 +360,39 @@ class SQLiteIndexCache:
     def _connect(self):
         return sqlite3.connect(str(self.path))
 
+    def _snapshot_file_path(self, manifest_hash):
+        return self.path.parent / f"{SNAPSHOT_FILE_PREFIX}{manifest_hash}{SNAPSHOT_FILE_SUFFIX}"
+
+    def _load_snapshot_file(self, manifest_hash):
+        try:
+            with self._snapshot_file_path(manifest_hash).open("rb") as f:
+                posts = pickle.load(f)
+            if not isinstance(posts, list):
+                return None
+            return [post for post in posts if isinstance(post, dict)]
+        except Exception:
+            return None
+
+    def _write_snapshot_file(self, manifest_hash, posts_blob):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            path = self._snapshot_file_path(manifest_hash)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with tmp_path.open("wb") as f:
+                f.write(posts_blob)
+            os.replace(tmp_path, path)
+            self._prune_snapshot_files(manifest_hash)
+        except Exception:
+            pass
+
+    def _prune_snapshot_files(self, keep_manifest_hash):
+        try:
+            for path in self.path.parent.glob(f"{SNAPSHOT_FILE_PREFIX}*{SNAPSHOT_FILE_SUFFIX}"):
+                if path.name != f"{SNAPSHOT_FILE_PREFIX}{keep_manifest_hash}{SNAPSHOT_FILE_SUFFIX}":
+                    path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     def _ensure_schema(self):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -382,11 +419,18 @@ class SQLiteIndexCache:
                         cache_version INTEGER NOT NULL,
                         manifest_hash TEXT NOT NULL,
                         posts_json TEXT NOT NULL,
+                        posts_blob BLOB,
                         updated_at REAL NOT NULL,
                         PRIMARY KEY (cache_version, manifest_hash)
                     )
                     """
                 )
+                columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(index_snapshots)").fetchall()
+                }
+                if "posts_blob" not in columns:
+                    conn.execute("ALTER TABLE index_snapshots ADD COLUMN posts_blob BLOB")
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_source_posts_kind "
                     "ON source_posts(cache_version, kind)"
@@ -448,13 +492,18 @@ class SQLiteIndexCache:
             self.available = False
 
     def load_snapshot(self, manifest_hash):
-        if not self.available or not manifest_hash:
+        if not manifest_hash:
+            return None
+        file_posts = self._load_snapshot_file(manifest_hash)
+        if file_posts is not None:
+            return file_posts
+        if not self.available:
             return None
         try:
             with self.lock, self._connect() as conn:
                 row = conn.execute(
                     """
-                    SELECT posts_json
+                    SELECT posts_json, posts_blob
                     FROM index_snapshots
                     WHERE cache_version = ? AND manifest_hash = ?
                     """,
@@ -462,26 +511,55 @@ class SQLiteIndexCache:
                 ).fetchone()
             if not row:
                 return None
-            posts = json.loads(row[0])
+            posts_json, posts_blob = row
+            posts = None
+            loaded_from_blob = False
+            if posts_blob:
+                try:
+                    posts = pickle.loads(posts_blob)
+                    loaded_from_blob = True
+                    self._write_snapshot_file(manifest_hash, posts_blob)
+                except Exception:
+                    posts = None
+                    loaded_from_blob = False
+            if posts is None:
+                if not posts_json:
+                    return None
+                posts = json.loads(posts_json)
+                self.backfill_snapshot_file(manifest_hash, posts)
             if not isinstance(posts, list):
                 return None
+            if loaded_from_blob:
+                return [post for post in posts if isinstance(post, dict)]
             return [self.refresh_cached_post(post) for post in posts if isinstance(post, dict)]
         except Exception:
             return None
 
-    def save_snapshot(self, manifest_hash, posts):
+    def backfill_snapshot_file(self, manifest_hash, posts):
         if not self.available or not manifest_hash:
             return
         try:
-            posts_json = json.dumps(posts, ensure_ascii=False, separators=(",", ":"))
+            posts_blob = pickle.dumps(posts, protocol=SNAPSHOT_PICKLE_PROTOCOL)
+            self._write_snapshot_file(manifest_hash, posts_blob)
+        except Exception:
+            pass
+
+    def save_snapshot(self, manifest_hash, posts):
+        if not manifest_hash:
+            return
+        try:
+            posts_blob = pickle.dumps(posts, protocol=SNAPSHOT_PICKLE_PROTOCOL)
+            self._write_snapshot_file(manifest_hash, posts_blob)
+            if not self.available:
+                return
             with self.lock, self._connect() as conn:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO index_snapshots
-                    (cache_version, manifest_hash, posts_json, updated_at)
-                    VALUES (?, ?, ?, ?)
+                    (cache_version, manifest_hash, posts_json, posts_blob, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (INDEX_CACHE_VERSION, manifest_hash, posts_json, time.time()),
+                    (INDEX_CACHE_VERSION, manifest_hash, "", None, time.time()),
                 )
                 conn.execute(
                     """
@@ -706,11 +784,49 @@ class LocalIndex:
         self.file_cache = {}
         self.sqlite_cache = SQLiteIndexCache(INDEX_DB_FILE)
         self.cache_dir_signature = None
+        self.comment_count_signature = None
+        self.comment_count = 0
 
     @staticmethod
     def _file_signature(path):
         stat = path.stat()
         return (stat.st_mtime_ns, stat.st_size)
+
+    @staticmethod
+    def _json_files_with_signatures(directory, kind):
+        paths = []
+        signatures = {}
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.name.endswith(".json") or not entry.is_file():
+                            continue
+                        stat = entry.stat()
+                    except OSError:
+                        continue
+                    path = directory / entry.name
+                    paths.append(path)
+                    signatures[(kind, str(path))] = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return [], {}
+        paths.sort(key=lambda path: path.name)
+        return paths, signatures
+
+    @staticmethod
+    def _json_file_count(directory):
+        count = 0
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.name.endswith(".json") and entry.is_file():
+                            count += 1
+                    except OSError:
+                        continue
+        except OSError:
+            return 0
+        return count
 
     @staticmethod
     def _directory_signature(path):
@@ -726,6 +842,15 @@ class LocalIndex:
             ("pid", self._directory_signature(PID_CACHE_DIR)),
             ("comment", self._directory_signature(COMMENT_CACHE_DIR)),
         )
+
+    def _comment_file_count(self):
+        signature = self._directory_signature(COMMENT_CACHE_DIR)
+        if self.comment_count_signature == signature:
+            return self.comment_count
+        count = self._json_file_count(COMMENT_CACHE_DIR)
+        self.comment_count_signature = signature
+        self.comment_count = count
+        return count
 
     def _reuse_current_index_if_unchanged(self, started_at, cache_dir_signature):
         with self.lock:
@@ -760,13 +885,14 @@ class LocalIndex:
             "posts_json": json.dumps(posts, ensure_ascii=False, separators=(",", ":")),
         }
 
-    def _load_index_file(self, path, kind):
+    def _load_index_file(self, path, kind, signature=None):
         source = f"pid_post_cache/{path.name}" if kind == "pid" else f"cache/{path.name}"
         cache_key = (kind, str(path))
-        try:
-            signature = self._file_signature(path)
-        except OSError:
-            return [], False
+        if signature is None:
+            try:
+                signature = self._file_signature(path)
+            except OSError:
+                return [], False
 
         with self.lock:
             cached = self.file_cache.get(cache_key)
@@ -785,9 +911,16 @@ class LocalIndex:
                 if post:
                     posts.append(post)
         elif isinstance(payload, dict):
-            post = normalize_post(payload, source=source)
-            if post:
-                posts.append(post)
+            payload_posts = payload.get("posts")
+            if isinstance(payload_posts, list):
+                for item in payload_posts:
+                    post = normalize_post(item, source=source)
+                    if post:
+                        posts.append(post)
+            else:
+                post = normalize_post(payload, source=source)
+                if post:
+                    posts.append(post)
 
         with self.lock:
             self.file_cache[cache_key] = {
@@ -850,11 +983,11 @@ class LocalIndex:
             max_workers = max(1, min(get_request_max_parallel(), len(to_parse)))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_path = {
-                    executor.submit(self._load_index_file, path, kind): path
-                    for path, _signature in to_parse
+                    executor.submit(self._load_index_file, path, kind, signature): (path, signature)
+                    for path, signature in to_parse
                 }
                 for future in as_completed(future_to_path):
-                    path = future_to_path[future]
+                    path, signature = future_to_path[future]
                     try:
                         posts, was_reused = future.result()
                     except Exception:
@@ -864,13 +997,6 @@ class LocalIndex:
                         reused += 1
                     else:
                         parsed += 1
-                        cache_key = (kind, str(path))
-                        signature = source_signatures.get(cache_key) if source_signatures else None
-                        if signature is None:
-                            try:
-                                signature = self._file_signature(path)
-                            except OSError:
-                                signature = None
                         if signature is not None:
                             source_records.append(self._source_record(kind, path, signature, posts))
             self.sqlite_cache.upsert_records(source_records)
@@ -1035,15 +1161,11 @@ class LocalIndex:
             return
 
         posts = {}
-        cache_files = sorted(CACHE_DIR.glob("*.json")) if CACHE_DIR.exists() else []
-        pid_files = sorted(PID_CACHE_DIR.glob("*.json")) if PID_CACHE_DIR.exists() else []
+        cache_files, cache_signatures = self._json_files_with_signatures(CACHE_DIR, "cache")
+        pid_files, pid_signatures = self._json_files_with_signatures(PID_CACHE_DIR, "pid")
         source_signatures = {}
-        for kind, paths in (("pid", pid_files), ("cache", cache_files)):
-            for path in paths:
-                try:
-                    source_signatures[(kind, str(path))] = self._file_signature(path)
-                except OSError:
-                    pass
+        source_signatures.update(pid_signatures)
+        source_signatures.update(cache_signatures)
         manifest_hash = self._manifest_hash(source_signatures)
         snapshot_posts = self.sqlite_cache.load_snapshot(manifest_hash)
         active_cache_keys = {("pid", str(path)) for path in pid_files}
@@ -1638,15 +1760,15 @@ class LocalIndex:
 
     def _refresh_stats_locked(self, cache_files=None, pid_files=None):
         if cache_files is None:
-            cache_files = list(CACHE_DIR.glob("*.json")) if CACHE_DIR.exists() else []
+            cache_files, _cache_signatures = self._json_files_with_signatures(CACHE_DIR, "cache")
         if pid_files is None:
-            pid_files = list(PID_CACHE_DIR.glob("*.json")) if PID_CACHE_DIR.exists() else []
+            pid_files, _pid_signatures = self._json_files_with_signatures(PID_CACHE_DIR, "pid")
         self.last_built_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.stats = {
             "posts": len(self.sorted_posts),
             "cache_files": len(cache_files),
             "pid_files": len(pid_files),
-            "comment_files": len(list(COMMENT_CACHE_DIR.glob("*.json"))) if COMMENT_CACHE_DIR.exists() else 0,
+            "comment_files": self._comment_file_count(),
             "built_at": self.last_built_at,
         }
 
@@ -1717,7 +1839,7 @@ def public_post(post, include_text=True, comment_limit=30):
         "title": custom_title or original_title,
         "original_title": original_title,
         "custom_title": custom_title,
-        "relative": post.get("relative") or relative_label(post),
+        "relative": relative_label(post),
         "dateLabel": post.get("dateLabel") or date_label(post),
         "dateKey": post.get("dateKey") or post_date_key(post),
         "post_time": post.get("post_time", ""),
