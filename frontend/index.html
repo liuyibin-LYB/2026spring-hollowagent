@@ -8,7 +8,7 @@
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%239c2f24'/%3E%3Ctext x='32' y='41' font-size='30' text-anchor='middle' fill='white' font-family='Arial, sans-serif'%3E%E6%B4%9E%3C/text%3E%3C/svg%3E"
     />
-    <link rel="stylesheet" href="./styles.css?v=organizer-4" />
+    <link rel="stylesheet" href="./styles.css?v=organizer-9" />
   </head>
   <body>
     <svg class="icon-sprite" aria-hidden="true">
@@ -91,7 +91,7 @@
               <svg class="icon"><use href="#icon-database"></use></svg>
               <span id="workbenchStatus">本地缓存</span>
             </div>
-            <button class="icon-button import-button" id="pidImportButton" title="从文段提取 PID 并抓取" aria-label="导入 PID">
+            <button class="icon-button import-button" id="pidImportButton" title="从文段或区间导入 PID" aria-label="导入 PID">
               <svg class="icon"><use href="#icon-import"></use></svg>
               <span>导入 PID</span>
             </button>
@@ -233,7 +233,7 @@
       <section class="pid-import-dialog" role="dialog" aria-modal="true" aria-labelledby="pidImportTitle">
         <header class="dialog-head">
           <div>
-            <h2 id="pidImportTitle">提取并抓取 PID</h2>
+            <h2 id="pidImportTitle">批量抓取 PID</h2>
             <p id="pidImportSubtitle">写入本地帖子和评论缓存</p>
           </div>
           <button class="icon-button" id="pidImportCloseButton" type="button" title="关闭" aria-label="关闭">×</button>
@@ -247,6 +247,17 @@
               placeholder="粘贴包含 PID 的文段"
               aria-label="包含 PID 的文段"
             ></textarea>
+            <div class="pid-import-range">
+              <label>
+                <span>PID 起点</span>
+                <input id="pidImportRangeStart" type="text" inputmode="numeric" autocomplete="off" aria-label="PID 区间起点" />
+              </label>
+              <span class="pid-import-range-separator">至</span>
+              <label>
+                <span>PID 终点</span>
+                <input id="pidImportRangeEnd" type="text" inputmode="numeric" autocomplete="off" aria-label="PID 区间终点" />
+              </label>
+            </div>
             <div class="pid-import-preview">
               <div class="pid-import-preview-head">
                 <span id="pidImportCount">0 个 PID</span>
@@ -258,12 +269,12 @@
           </div>
           <footer class="dialog-actions">
             <button type="button" id="pidImportCancelButton">取消</button>
-            <button class="primary-action" type="submit" id="pidImportSubmitButton" disabled>提取并抓取</button>
+            <button class="primary-action" type="submit" id="pidImportSubmitButton" disabled>批量抓取</button>
           </footer>
         </form>
       </section>
     </div>
 
-    <script src="./app.js?v=organizer-5"></script>
+    <script src="./app.js?v=organizer-14"></script>
   </body>
 </html>

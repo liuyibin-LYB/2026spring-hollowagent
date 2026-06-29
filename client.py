@@ -286,6 +286,77 @@ class TreeholeClient:
 
         return self._get_post_legacy(post_id)
 
+    def list_recent_posts(self, page=1, limit=100, **kwargs):
+        """
+        List recent posts from the lightweight feed API.
+
+        Returns the same normalized envelope shape used by search_posts().
+        """
+        try:
+            normalized_page = max(1, int(page or 1))
+        except Exception:
+            normalized_page = 1
+        try:
+            normalized_limit = max(1, min(500, int(limit or 100)))
+        except Exception:
+            normalized_limit = 100
+
+        params = {
+            "page": normalized_page,
+            "limit": normalized_limit,
+        }
+        params.update(kwargs)
+
+        response = self._request(
+            "GET",
+            "https://treehole.pku.edu.cn/chapi/api/v3/hole/list",
+            params=params,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        if result.get("code") != 20000:
+            return {
+                "success": False,
+                "data": {"data": [], "total": 0, "page": normalized_page, "limit": normalized_limit, "last_page": 0},
+                "message": result.get("message", "Unknown error"),
+                "code": result.get("code"),
+            }
+
+        payload = result.get("data") or {}
+        if isinstance(payload, dict):
+            posts = payload.get("list") or payload.get("data") or []
+            total = payload.get("total", len(posts))
+        elif isinstance(payload, list):
+            posts = payload
+            total = len(posts)
+        else:
+            posts = []
+            total = 0
+
+        if not isinstance(posts, list):
+            posts = []
+        try:
+            total_count = int(total or 0)
+        except Exception:
+            total_count = len(posts)
+        for post in posts:
+            if isinstance(post, dict):
+                post.setdefault("comments", [])
+                post.setdefault("comment_list", [])
+
+        return {
+            "success": True,
+            "data": {
+                "data": posts,
+                "total": total,
+                "page": normalized_page,
+                "limit": normalized_limit,
+                "last_page": (total_count + normalized_limit - 1) // normalized_limit if normalized_limit > 0 else 1,
+            },
+            "message": result.get("message", "success"),
+        }
+
     def get_comment(self, post_id, page=1, limit=15, sort="asc"):
         """
         Get comments for a post.

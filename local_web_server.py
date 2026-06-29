@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import pickle
+import queue
 import re
 import sqlite3
 import threading
@@ -15,6 +16,10 @@ from datetime import date, datetime, timedelta
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+
+from requests.adapters import HTTPAdapter
+
+from client import TreeholeClient
 
 ROOT = Path(__file__).resolve().parent
 FRONTEND_DIR = ROOT / "frontend"
@@ -32,8 +37,9 @@ SNAPSHOT_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
 SNAPSHOT_FILE_PREFIX = f"local_index_snapshot_v{INDEX_CACHE_VERSION}_"
 SNAPSHOT_FILE_SUFFIX = ".pkl"
 FAST_REINDEX_PID_LIMIT = 12000
-PID_IMPORT_MAX_ITEMS = 500
-PID_IMPORT_COMMENT_PREVIEW_LIMIT = 5
+PID_IMPORT_COMMENT_PREVIEW_LIMIT = 10
+PID_IMPORT_RESULT_PREVIEW_LIMIT = 120
+PID_IMPORT_JOB_RETENTION_SECONDS = 3600
 TITLE_GENERATION_BATCH_LIMIT = 24
 FULLWIDTH_DIGIT_TRANSLATION = str.maketrans("０１２３４５６７８９", "0123456789")
 PID_TEXT_PATTERN = re.compile(r"(?<!\d)\d{5,10}(?!\d)")
@@ -89,6 +95,32 @@ def extract_pids_from_text(value, limit=None):
         if limit is not None and len(pids) >= limit:
             break
     return pids
+
+
+def parse_pid_value(value):
+    text = normalize_text(value).translate(FULLWIDTH_DIGIT_TRANSLATION)
+    if not text:
+        return 0
+    if not re.fullmatch(r"\d{1,10}", text):
+        return 0
+    return to_int(text, 0)
+
+
+def expand_pid_range(start_value, end_value):
+    start_text = normalize_text(start_value)
+    end_text = normalize_text(end_value)
+    if not start_text and not end_text:
+        return []
+    if not start_text or not end_text:
+        raise ChatError("PID 区间需要同时填写起点和终点。", status=400)
+
+    start_pid = parse_pid_value(start_value)
+    end_pid = parse_pid_value(end_value)
+    if start_pid <= 0 or end_pid <= 0:
+        raise ChatError("PID 区间只支持正整数。", status=400)
+
+    step = 1 if end_pid >= start_pid else -1
+    return list(range(start_pid, end_pid + step, step))
 
 
 def now_label():
@@ -1358,11 +1390,11 @@ class LocalIndex:
             self._refresh_stats_locked()
             self.cache_dir_signature = self._cache_directory_signature()
 
-    def mark_deleted(self, pid):
+    def _deleted_post_placeholder(self, pid):
         pid = to_int(pid)
         with self.lock:
             existing = dict(self.posts.get(pid) or {})
-        post = {
+        return {
             "pid": pid,
             "title": deleted_title(pid),
             "text": existing.get("text", ""),
@@ -1378,6 +1410,10 @@ class LocalIndex:
             "source": existing.get("source") or f"pid_post_cache/{pid}.json",
             "deleted": True,
         }
+
+    def mark_deleted(self, pid):
+        pid = to_int(pid)
+        post = self._deleted_post_placeholder(pid)
         with self.lock:
             self.posts[pid] = post
             self.sorted_posts = sorted(self.posts.values(), key=lambda item: item.get("pid", 0), reverse=True)
@@ -1481,29 +1517,33 @@ class LocalIndex:
             MAINTENANCE_BRIDGE.status = f"帖子刷新失败：{exc}"
             raise ChatError(f"帖子刷新失败：{exc}", status=502)
 
-    def _import_post_preview_with_agent(self, agent, pid):
+    def _import_post_preview_with_agent(
+        self,
+        agent,
+        pid,
+        request_callback=None,
+        cache_saver=None,
+        request_client=None,
+    ):
         pid = to_int(pid)
         if pid <= 0:
             raise ChatError("PID 不合法。", status=400)
-        agent._pid_fetch_rate_limiter.acquire()
-        try:
-            result = agent.client.get_post(pid)
-        except Exception as exc:
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            if status_code not in {404, 410}:
-                raise
-            result = {"success": False, "data": None, "status_code": status_code}
-        if not result.get("success"):
-            if not looks_deleted_response(result, result.get("status_code")):
-                detail = response_error_text(result) or "树洞接口未返回成功状态"
-                raise ChatError(f"帖子导入失败：{detail}", status=502)
-            agent._save_pid_post_cache(pid, None)
+        post = agent.get_post_by_pid(
+            pid,
+            include_comments=False,
+            max_comments=PID_IMPORT_COMMENT_PREVIEW_LIMIT,
+            quiet=True,
+            use_cache=True,
+            on_request_start=request_callback,
+            cache_saver=cache_saver,
+            request_client=request_client,
+        )
+        if not post:
             MAINTENANCE_BRIDGE.status = f"帖子 #{pid} 已删除或不可访问"
             return self.mark_deleted(pid)
 
-        post = agent._normalize_post_metadata(result.get("data", {}))
+        post = dict(post)
         post["comments"] = list(post.get("comments") or post.get("comment_list") or [])[:PID_IMPORT_COMMENT_PREVIEW_LIMIT]
-        agent._save_pid_post_cache(pid, post)
 
         normalized = normalize_post({"post": post}, source=f"pid_post_cache/{pid}.json")
         if not normalized:
@@ -1512,49 +1552,749 @@ class LocalIndex:
         normalized["comments"] = self.load_comments(pid, normalized.get("comments") or [])
         return normalized
 
-    def import_pids_from_text(self, text):
-        pids = extract_pids_from_text(text, limit=PID_IMPORT_MAX_ITEMS + 1)
+    def _pid_import_result_item(self, pid, post=None, status=None, error=None, latency=0.0, source="single"):
+        pid = to_int(pid)
+        if status == "failed":
+            return {
+                "pid": pid,
+                "status": "failed",
+                "error": str(error or ""),
+                "latency": latency,
+                "source": source,
+            }
+
+        post = post or {}
+        resolved_status = status or ("deleted" if post.get("deleted") else "fetched")
+        comment_count = len(post.get("comments") or [])
+        expected_comments = to_int(post.get("reply", post.get("comment_total", 0)), 0)
+        return {
+            "pid": pid,
+            "status": resolved_status,
+            "title": post.get("title") or deleted_title(pid),
+            "reply": post.get("reply", 0),
+            "star": post.get("star", 0),
+            "comments": comment_count,
+            "comment_total": max(expected_comments, comment_count),
+            "comment_status": "ok" if comment_count or expected_comments == 0 else "metadata",
+            "latency": latency,
+            "source": source,
+        }
+
+    @staticmethod
+    def _pid_import_dense_enough(pids):
+        valid = sorted({to_int(pid, 0) for pid in pids or [] if to_int(pid, 0) > 0})
+        if len(valid) < 50:
+            return False
+        span = valid[-1] - valid[0] + 1
+        if span <= 0:
+            return False
+        return len(valid) / span >= 0.35
+
+    def _feed_import_normalize_post(self, agent, raw_post):
+        pid = to_int(raw_post.get("pid"), 0)
+        if pid <= 0:
+            return None
+        post = agent._normalize_post_metadata(dict(raw_post))
+        cached_comments = self.load_comments(pid, post.get("comments") or post.get("comment_list") or [])
+        post["comments"] = cached_comments
+        post["comment_list"] = cached_comments
+        normalized = normalize_post({"post": post}, source=f"pid_post_cache/{pid}.json")
+        if not normalized:
+            return None
+        normalized["deleted"] = False
+        normalized["comments"] = self.load_comments(pid, normalized.get("comments") or [])
+        return post, normalized
+
+    def _import_dense_pids_by_feed(self, agent, pids, cache_saver=None, feed_progress_callback=None):
+        target_pids = {to_int(pid, 0) for pid in pids or [] if to_int(pid, 0) > 0}
+        started_at = time.time()
+        stats = {
+            "enabled": False,
+            "requests_started": 0,
+            "active_requests": 0,
+            "requested_pages": 0,
+            "returned_pages": 0,
+            "api_requests": 0,
+            "pages": 0,
+            "hits": 0,
+            "deleted": 0,
+            "resolved": 0,
+            "start_page": 0,
+            "covered_min_pid": 0,
+            "covered_max_pid": 0,
+            "source": "",
+            "elapsed": 0.0,
+            "stop_reason": "not_started",
+            "materialized": 0,
+            "materialize_total": 0,
+        }
+        stats_lock = threading.Lock()
+        page_cache_lock = threading.Lock()
+        page_inflight = set()
+        feed_covered_pids = set()
+        feed_hit_pids = set()
+        processed_pages = set()
+
+        def update_feed_stats(**updates):
+            snapshot = None
+            with stats_lock:
+                stats.update(updates)
+                stats["elapsed"] = time.time() - started_at
+                snapshot = dict(stats)
+            if feed_progress_callback:
+                feed_progress_callback(snapshot)
+            return snapshot
+
+        def begin_feed_page(page):
+            with stats_lock:
+                stats["requests_started"] += 1
+                stats["active_requests"] += 1
+                stats["requested_pages"] += 1
+                stats["last_page"] = page
+                stats["elapsed"] = time.time() - started_at
+                snapshot = dict(stats)
+            if feed_progress_callback:
+                feed_progress_callback(snapshot)
+
+        def finish_feed_page(page, info, request_started=False):
+            with page_cache_lock:
+                is_new_page = page not in page_cache
+                page_cache[page] = info
+                page_inflight.discard(page)
+            updates = {"last_page": page, "stop_reason": info.get("error") or stats.get("stop_reason", "")}
+            if request_started or is_new_page:
+                with stats_lock:
+                    if request_started:
+                        stats["api_requests"] += 1
+                        stats["active_requests"] = max(0, stats["active_requests"] - 1)
+                    if is_new_page:
+                        stats["returned_pages"] += 1
+                    updates["api_requests"] = stats["api_requests"]
+                    updates["active_requests"] = stats["active_requests"]
+                    updates["returned_pages"] = stats["returned_pages"]
+                    updates["hits"] = stats["hits"]
+                    updates["deleted"] = stats["deleted"]
+                    updates["resolved"] = stats["resolved"]
+            update_feed_stats(**updates)
+            return info
+
+        if not target_pids or not self._pid_import_dense_enough(target_pids):
+            return {}, [], stats
+
+        min_target = min(target_pids)
+        max_target = max(target_pids)
+        page_limit = get_pid_import_feed_page_limit()
+        page_workers = get_pid_import_feed_max_page_workers()
+        update_feed_stats(enabled=True, stop_reason="seeking", page_limit=page_limit, page_workers=page_workers)
+        page_cache = {}
+
+        def fetch_page(page):
+            page = max(1, to_int(page, 1))
+            with page_cache_lock:
+                cached = page_cache.get(page)
+                if not cached:
+                    page_inflight.add(page)
+            if cached:
+                return cached
+            begin_feed_page(page)
+            source = "list_comments"
+            try:
+                result = agent.client.search_posts(
+                    "",
+                    page=page,
+                    limit=page_limit,
+                    comment_limit=PID_IMPORT_COMMENT_PREVIEW_LIMIT,
+                )
+            except Exception as exc:
+                info = {"page": page, "posts": [], "pids": [], "error": f"feed_error:{exc}"}
+                return finish_feed_page(page, info, request_started=True)
+            if not result.get("success"):
+                source = "list"
+                try:
+                    result = agent.client.list_recent_posts(page=page, limit=page_limit)
+                except Exception as exc:
+                    info = {"page": page, "posts": [], "pids": [], "error": f"feed_error:{exc}"}
+                    return finish_feed_page(page, info, request_started=True)
+                if not result.get("success"):
+                    info = {"page": page, "posts": [], "pids": [], "error": response_error_text(result) or "feed_failed"}
+                    return finish_feed_page(page, info, request_started=True)
+            page_posts = (result.get("data") or {}).get("data") or []
+            raw_pids = [
+                to_int(post.get("pid"), 0)
+                for post in page_posts
+                if isinstance(post, dict) and to_int(post.get("pid"), 0) > 0
+            ]
+            info = {
+                "page": page,
+                "posts": page_posts if isinstance(page_posts, list) else [],
+                "pids": raw_pids,
+                "min_pid": min(raw_pids) if raw_pids else 0,
+                "max_pid": max(raw_pids) if raw_pids else 0,
+                "count": len(page_posts) if isinstance(page_posts, list) else 0,
+                "source": source,
+                "error": "",
+            }
+            return finish_feed_page(page, info, request_started=True)
+
+        first = fetch_page(1)
+        if first.get("error"):
+            return {}, [], update_feed_stats(stop_reason=first["error"])
+        if not first.get("pids"):
+            return {}, [], update_feed_stats(stop_reason="empty_feed")
+        if max_target > first["max_pid"]:
+            return {}, [], update_feed_stats(stop_reason="target_newer_than_feed")
+
+        if first["min_pid"] <= max_target:
+            start_page = 1
+        else:
+            low = 1
+            high = 0
+            probe_page = max(2, (first["max_pid"] - max_target) // max(1, page_limit) + 1)
+            for _ in range(24):
+                probe = fetch_page(probe_page)
+                if probe.get("error") or not probe.get("pids") or probe["min_pid"] <= max_target:
+                    high = probe_page
+                    break
+                low = probe_page
+                probe_page = max(probe_page + 1, probe_page * 2)
+            if not high:
+                return {}, [], update_feed_stats(stop_reason="seek_limit")
+            for _ in range(24):
+                if high - low <= 1:
+                    break
+                mid = (low + high) // 2
+                probe = fetch_page(mid)
+                if probe.get("error") or not probe.get("pids") or probe["min_pid"] <= max_target:
+                    high = mid
+                else:
+                    low = mid
+            start_page = high
+
+        update_feed_stats(start_page=start_page, stop_reason="fetching")
+        estimated_pages = max(1, (max_target - min_target + page_limit) // max(1, page_limit))
+        page_budget = max(1, estimated_pages + page_workers + 4)
+        max_rounds = max(12, (page_budget + max(1, page_workers) - 1) // max(1, page_workers) + 2)
+        next_page = start_page
+        covered_min = 0
+        covered_max = 0
+        raw_posts_by_pid = {}
+
+        def process_feed_page(info):
+            nonlocal covered_min, covered_max
+            page_no = to_int(info.get("page"), 0)
+            if page_no in processed_pages:
+                return False
+            processed_pages.add(page_no)
+
+            if info.get("error"):
+                update_feed_stats(stop_reason=info["error"])
+                return True
+            if not info.get("pids"):
+                update_feed_stats(stop_reason="empty_page")
+                return True
+
+            covered_min = info["min_pid"] if not covered_min else min(covered_min, info["min_pid"])
+            covered_max = max(covered_max, info["max_pid"])
+            page_hits = set()
+            for raw_post in info.get("posts") or []:
+                if not isinstance(raw_post, dict):
+                    continue
+                pid = to_int(raw_post.get("pid"), 0)
+                if pid in target_pids:
+                    page_hits.add(pid)
+                    if pid not in raw_posts_by_pid:
+                        raw_posts_by_pid[pid] = raw_post
+
+            if covered_min and covered_max:
+                feed_covered_pids.update(pid for pid in target_pids if covered_min <= pid <= covered_max)
+            feed_hit_pids.update(page_hits)
+
+            with stats_lock:
+                next_pages = stats["pages"] + 1
+            update_feed_stats(
+                pages=next_pages,
+                hits=len(feed_hit_pids),
+                deleted=max(0, len(feed_covered_pids) - len(feed_hit_pids)),
+                resolved=len(feed_covered_pids),
+                covered_min_pid=covered_min,
+                covered_max_pid=covered_max,
+                source=info.get("source", stats.get("source", "")),
+                stop_reason="fetching",
+            )
+            if info["min_pid"] <= min_target or info["count"] < page_limit:
+                update_feed_stats(stop_reason="covered_target" if info["min_pid"] <= min_target else "short_page")
+                return True
+            return False
+
+        stop = False
+        for _round in range(max_rounds):
+            if page_budget <= 0:
+                update_feed_stats(stop_reason="page_budget")
+                break
+            page_count = max(1, min(page_workers, page_budget))
+            page_numbers = list(range(next_page, next_page + page_count))
+            page_budget -= len(page_numbers)
+            if not page_numbers:
+                break
+            max_workers = min(page_workers, len(page_numbers))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(fetch_page, page): page for page in page_numbers}
+                stop = False
+                pending_page_infos = {}
+                next_process_page = page_numbers[0]
+                for future in as_completed(futures):
+                    info = future.result()
+                    pending_page_infos[to_int(info.get("page"), 0)] = info
+                    while next_process_page in pending_page_infos:
+                        page_info = pending_page_infos.pop(next_process_page)
+                        if process_feed_page(page_info):
+                            stop = True
+                            break
+                        next_process_page += 1
+                    if stop:
+                        for pending_future in futures:
+                            pending_future.cancel()
+                        break
+            if stop:
+                break
+            next_page = page_numbers[-1] + 1
+        else:
+            update_feed_stats(stop_reason="max_rounds")
+
+        results_by_pid = {}
+        fetched_posts = []
+        materialized = 0
+        materialize_total = len(target_pids)
+        if raw_posts_by_pid:
+            update_feed_stats(
+                stop_reason="materializing",
+                materialized=materialized,
+                materialize_total=materialize_total,
+            )
+        for pid, raw_post in raw_posts_by_pid.items():
+            normalized_pair = self._feed_import_normalize_post(agent, raw_post)
+            if not normalized_pair:
+                continue
+            cache_post, normalized = normalized_pair
+            if cache_saver:
+                cache_saver(pid, cache_post)
+            else:
+                agent._save_pid_post_cache(pid, cache_post)
+            results_by_pid[pid] = normalized
+            fetched_posts.append(normalized)
+            materialized += 1
+            if materialized % 500 == 0:
+                update_feed_stats(
+                    stop_reason="materializing",
+                    materialized=materialized,
+                    materialize_total=materialize_total,
+                )
+
+        if covered_min and covered_max:
+            update_feed_stats(
+                stop_reason="materializing",
+                materialized=materialized,
+                materialize_total=materialize_total,
+            )
+            for pid in target_pids:
+                if pid in results_by_pid or pid < covered_min or pid > covered_max:
+                    continue
+                if cache_saver:
+                    cache_saver(pid, None)
+                else:
+                    agent._save_pid_post_cache(pid, None)
+                results_by_pid[pid] = self._deleted_post_placeholder(pid)
+                materialized += 1
+                if materialized % 500 == 0:
+                    update_feed_stats(
+                        stop_reason="materializing",
+                        materialized=materialized,
+                        materialize_total=materialize_total,
+                    )
+
+        final_stats = update_feed_stats(
+            covered_min_pid=covered_min,
+            covered_max_pid=covered_max,
+            hits=sum(1 for post in results_by_pid.values() if not post.get("deleted")),
+            deleted=sum(1 for post in results_by_pid.values() if post.get("deleted")),
+            resolved=len(results_by_pid),
+            materialized=len(results_by_pid),
+            materialize_total=materialize_total,
+            stop_reason="materialized",
+        )
+        return results_by_pid, fetched_posts, final_stats
+
+    def build_pid_import_pids(self, text="", range_start=None, range_end=None):
+        pids = []
+        seen = set()
+
+        def append_unique(items):
+            for pid in items or []:
+                pid = to_int(pid, 0)
+                if pid <= 0 or pid in seen:
+                    continue
+                seen.add(pid)
+                pids.append(pid)
+
+        append_unique(extract_pids_from_text(text))
+        append_unique(expand_pid_range(range_start, range_end))
+
         if not pids:
             raise ChatError("没有提取到有效 PID。", status=400)
-        if len(pids) > PID_IMPORT_MAX_ITEMS:
-            raise ChatError(f"一次最多导入 {PID_IMPORT_MAX_ITEMS} 个 PID，请分批处理。", status=400)
+        return pids
+
+    def import_pids(self, pids, progress_callback=None):
+        unique_pids = []
+        seen = set()
+        for pid in pids or []:
+            pid = to_int(pid, 0)
+            if pid <= 0 or pid in seen:
+                continue
+            seen.add(pid)
+            unique_pids.append(pid)
+        if not unique_pids:
+            raise ChatError("没有提取到有效 PID。", status=400)
+        pids = unique_pids
 
         with MAINTENANCE_BRIDGE.lock:
             agent = MAINTENANCE_BRIDGE.get_agent()
 
         started_at = time.time()
         max_workers = min(get_pid_import_max_parallel(), len(pids))
+        request_rate_limit = get_pid_import_request_rate_limit()
         MAINTENANCE_BRIDGE.status = f"批量导入 {len(pids)} 个 PID 中"
         results_by_pid = {}
         fetched_posts = []
+        progress_counts = {"fetched": 0, "deleted": 0, "failed": 0}
+        progress_lock = threading.Lock()
+        completed = 0
+        started_count = 0
+        active_count = 0
+        peak_active_count = 0
+        api_request_count = 0
+        total_latency = 0.0
+        latency_samples = 0
+        last_latency = 0.0
+        last_api_request_at = 0.0
+        cache_write_threads = min(get_pid_import_cache_write_threads(), max_workers)
+        cache_queue = queue.Queue()
+        cache_sentinel = object()
+        cache_enqueued = 0
+        cache_written = 0
+        cache_write_failed = 0
+        cache_writer_errors = []
+        original_cache_saver = agent._save_pid_post_cache
+        worker_local = threading.local()
+        worker_client_count = 0
+        worker_client_lock = threading.Lock()
+        worker_request_timeout = get_pid_import_request_timeout()
+        recent_window = 10.0
+        recent_request_times = []
+        recent_complete_times = []
+        feed_stats = {}
+        feed_api_requests_seen = 0
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_pid = {
-                executor.submit(self._import_post_preview_with_agent, agent, pid): pid
-                for pid in pids
-            }
-            for future in as_completed(future_to_pid):
-                pid = future_to_pid[future]
-                try:
-                    post = future.result()
-                    if not post.get("deleted"):
-                        fetched_posts.append(post)
-                    comment_count = len(post.get("comments") or [])
-                    expected_comments = to_int(post.get("reply", post.get("comment_total", 0)), 0)
-                    results_by_pid[pid] = {
-                        "pid": pid,
-                        "status": "deleted" if post.get("deleted") else "fetched",
-                        "title": post.get("title") or deleted_title(pid),
-                        "reply": post.get("reply", 0),
-                        "star": post.get("star", 0),
-                        "comments": comment_count,
-                        "comment_total": max(expected_comments, comment_count),
-                        "comment_status": "ok" if comment_count or expected_comments == 0 else "empty",
+        def mark_recent(items, now):
+            items.append(now)
+            cutoff = now - recent_window
+            while items and items[0] < cutoff:
+                items.pop(0)
+
+        def emit_progress(completed_count=0, current_pid=None, result=None, stage="running"):
+            elapsed = max(0.001, time.time() - started_at)
+            start_rate = started_count / elapsed
+            api_request_rate = api_request_count / elapsed
+            complete_rate = completed_count / elapsed
+            recent_request_rate = len(recent_request_times) / recent_window
+            recent_complete_rate = len(recent_complete_times) / recent_window
+            avg_latency = total_latency / latency_samples if latency_samples else 0.0
+            status_message = (
+                f"批量导入进度 {completed_count}/{len(pids)}："
+                f"成功 {progress_counts['fetched']}，已删除 {progress_counts['deleted']}，失败 {progress_counts['failed']}；"
+                f"活跃 {active_count}/{max_workers}，近10秒请求 {recent_request_rate:.1f}/s，"
+                f"近10秒完成 {recent_complete_rate:.1f}/s，均耗 {avg_latency:.2f}s"
+            )
+            stage_message = {
+                "feed": "正在读取列表页",
+                "cache_flush": "正在写入缓存",
+                "done": "批量导入完成",
+            }.get(stage, "批量导入中")
+            MAINTENANCE_BRIDGE.status = status_message if stage != "done" else (
+                f"批量导入完成：成功 {progress_counts['fetched']}，"
+                f"已删除 {progress_counts['deleted']}，失败 {progress_counts['failed']}，"
+                f"耗时 {elapsed:.2f}s，均耗 {avg_latency:.2f}s"
+            )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": stage,
+                        "total": len(pids),
+                        "completed": completed_count,
+                        "started": started_count,
+                        "active": active_count,
+                        "peak_active": peak_active_count,
+                        "api_requests": api_request_count,
+                        "cache_writes_queued": cache_enqueued,
+                        "cache_writes_done": cache_written,
+                        "cache_write_failed": cache_write_failed,
+                        "cache_write_queue": cache_queue.qsize(),
+                        "worker_clients": worker_client_count,
+                        "worker_request_timeout": worker_request_timeout,
+                        "feed_enabled": bool(feed_stats.get("enabled")),
+                        "feed_requests_started": feed_stats.get("requests_started", 0),
+                        "feed_active_requests": feed_stats.get("active_requests", 0),
+                        "feed_requested_pages": feed_stats.get("requested_pages", 0),
+                        "feed_returned_pages": feed_stats.get("returned_pages", 0),
+                        "feed_resolved": feed_stats.get("resolved", 0),
+                        "feed_hits": feed_stats.get("hits", 0),
+                        "feed_deleted": feed_stats.get("deleted", 0),
+                        "feed_pages": feed_stats.get("pages", 0),
+                        "feed_page_limit": feed_stats.get("page_limit", 0),
+                        "feed_api_requests": feed_stats.get("api_requests", 0),
+                        "feed_source": feed_stats.get("source", ""),
+                        "feed_elapsed": feed_stats.get("elapsed", 0.0),
+                        "feed_stop_reason": feed_stats.get("stop_reason", ""),
+                        "feed_materialized": feed_stats.get("materialized", 0),
+                        "feed_materialize_total": feed_stats.get("materialize_total", 0),
+                        "current_pid": current_pid,
+                        "fetched": progress_counts["fetched"],
+                        "deleted": progress_counts["deleted"],
+                        "failed": progress_counts["failed"],
+                        "max_workers": max_workers,
+                        "cache_write_threads": cache_write_threads,
+                        "request_rate_limit": request_rate_limit,
+                        "elapsed": elapsed,
+                        "start_rate": start_rate,
+                        "api_request_rate": api_request_rate,
+                        "api_request_rate_recent": recent_request_rate,
+                        "complete_rate": complete_rate,
+                        "complete_rate_recent": recent_complete_rate,
+                        "recent_window": recent_window,
+                        "avg_latency": avg_latency,
+                        "last_latency": last_latency,
+                        "last_api_request_at": last_api_request_at,
+                        "queue_remaining": max(0, len(pids) - completed_count - active_count),
+                        "message": stage_message,
+                        "result": result,
                     }
+                )
+
+        emit_progress(completed_count=0, stage="running")
+
+        def record_api_request(request_pid):
+            nonlocal api_request_count, last_api_request_at
+            with progress_lock:
+                now = time.time()
+                api_request_count += 1
+                last_api_request_at = now
+                mark_recent(recent_request_times, now)
+                emit_progress(completed_count=completed, current_pid=request_pid)
+
+        def cache_saver(pid, post):
+            nonlocal cache_enqueued
+            cache_queue.put((pid, post))
+            with progress_lock:
+                cache_enqueued += 1
+
+        def cache_writer():
+            nonlocal cache_written, cache_write_failed
+            while True:
+                item = cache_queue.get()
+                should_emit_cache_progress = False
+                try:
+                    if item is cache_sentinel:
+                        return
+                    pid, post = item
+                    try:
+                        original_cache_saver(pid, post)
+                        with progress_lock:
+                            cache_written += 1
+                            should_emit_cache_progress = (cache_written + cache_write_failed) % 500 == 0
+                    except Exception as exc:
+                        with progress_lock:
+                            cache_write_failed += 1
+                            should_emit_cache_progress = (cache_written + cache_write_failed) % 500 == 0
+                            if len(cache_writer_errors) < 5:
+                                cache_writer_errors.append(str(exc))
+                    if should_emit_cache_progress:
+                        cache_stage = "feed_materialize" if feed_stats.get("stop_reason") in {"materializing", "materialized"} else "cache_flush"
+                        emit_progress(completed_count=completed, stage=cache_stage)
+                finally:
+                    cache_queue.task_done()
+
+        def get_worker_client():
+            nonlocal worker_client_count
+            client = getattr(worker_local, "client", None)
+            if client is None:
+                client = TreeholeClient(
+                    cookies_file=getattr(agent.client, "cookies_file", None),
+                    request_timeout=worker_request_timeout,
+                )
+                adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1, pool_block=False)
+                client.session.mount("https://", adapter)
+                client.session.mount("http://", adapter)
+                worker_local.client = client
+                with worker_client_lock:
+                    worker_client_count += 1
+            return client
+
+        def handle_feed_progress(current_feed_stats):
+            nonlocal api_request_count, last_api_request_at, feed_stats, feed_api_requests_seen
+            with progress_lock:
+                incoming = dict(current_feed_stats or {})
+                merged_feed_stats = {**feed_stats, **incoming}
+                for key in (
+                    "requests_started",
+                    "requested_pages",
+                    "returned_pages",
+                    "api_requests",
+                    "pages",
+                    "hits",
+                    "deleted",
+                    "resolved",
+                    "materialized",
+                    "materialize_total",
+                ):
+                    merged_feed_stats[key] = max(
+                        to_int(feed_stats.get(key), 0),
+                        to_int(incoming.get(key), 0),
+                    )
+                if "active_requests" in incoming:
+                    merged_feed_stats["active_requests"] = max(0, to_int(incoming.get("active_requests"), 0))
+                merged_feed_stats["elapsed"] = max(
+                    float(feed_stats.get("elapsed") or 0.0),
+                    float(incoming.get("elapsed") or 0.0),
+                )
+                incoming_min = to_int(incoming.get("covered_min_pid"), 0)
+                existing_min = to_int(feed_stats.get("covered_min_pid"), 0)
+                if incoming_min and existing_min:
+                    merged_feed_stats["covered_min_pid"] = min(incoming_min, existing_min)
+                elif incoming_min or existing_min:
+                    merged_feed_stats["covered_min_pid"] = incoming_min or existing_min
+                merged_feed_stats["covered_max_pid"] = max(
+                    to_int(feed_stats.get("covered_max_pid"), 0),
+                    to_int(incoming.get("covered_max_pid"), 0),
+                )
+                feed_stats = merged_feed_stats
+                feed_requests_started = to_int(feed_stats.get("requests_started"), 0)
+                new_requests = max(0, feed_requests_started - feed_api_requests_seen)
+                if new_requests:
+                    now = time.time()
+                    api_request_count += new_requests
+                    last_api_request_at = now
+                    for _ in range(new_requests):
+                        mark_recent(recent_request_times, now)
+                    feed_api_requests_seen = feed_requests_started
+                feed_stage = "feed_materialize" if feed_stats.get("stop_reason") in {"materializing", "materialized"} else "feed"
+                emit_progress(completed_count=completed, stage=feed_stage)
+
+        cache_threads = [
+            threading.Thread(target=cache_writer, daemon=True)
+            for _ in range(cache_write_threads)
+        ]
+        for thread in cache_threads:
+            thread.start()
+
+        feed_results_by_pid, feed_fetched_posts, feed_stats = self._import_dense_pids_by_feed(
+            agent,
+            pids,
+            cache_saver=cache_saver,
+            feed_progress_callback=handle_feed_progress,
+        )
+        remaining_feed_requests = max(0, to_int(feed_stats.get("requests_started"), 0) - feed_api_requests_seen)
+        if remaining_feed_requests:
+            with progress_lock:
+                now = time.time()
+                api_request_count += remaining_feed_requests
+                last_api_request_at = now
+                for _ in range(remaining_feed_requests):
+                    mark_recent(recent_request_times, now)
+                feed_api_requests_seen += remaining_feed_requests
+                feed_stage = "feed_materialize" if feed_stats.get("stop_reason") in {"materializing", "materialized"} else "feed"
+                emit_progress(completed_count=completed, stage=feed_stage)
+        for pid in pids:
+            post = feed_results_by_pid.get(pid)
+            if not post:
+                continue
+            result_item = self._pid_import_result_item(pid, post=post, source="feed")
+            results_by_pid[pid] = result_item
+            if post and not post.get("deleted"):
+                fetched_posts.append(post)
+            if result_item["status"] in progress_counts:
+                progress_counts[result_item["status"]] += 1
+            completed += 1
+            mark_recent(recent_complete_times, time.time())
+            feed_result_stage = "feed_materialize" if feed_stats.get("stop_reason") in {"materializing", "materialized"} else "feed"
+            emit_progress(completed_count=completed, current_pid=pid, result=result_item, stage=feed_result_stage)
+
+        pid_queue = queue.Queue()
+        remaining_pids = [pid for pid in pids if pid not in results_by_pid]
+        for pid in remaining_pids:
+            pid_queue.put(pid)
+
+        def import_worker():
+            nonlocal active_count, completed, latency_samples, last_latency
+            nonlocal peak_active_count, started_count, total_latency
+            while True:
+                try:
+                    pid = pid_queue.get_nowait()
+                except queue.Empty:
+                    return
+
+                pid_started_at = time.time()
+                with progress_lock:
+                    started_count += 1
+                    active_count += 1
+                    peak_active_count = max(peak_active_count, active_count)
+                    emit_progress(completed_count=completed, current_pid=pid)
+
+                try:
+                    post = self._import_post_preview_with_agent(
+                        agent,
+                        pid,
+                        request_callback=record_api_request,
+                        cache_saver=cache_saver,
+                        request_client=get_worker_client(),
+                    )
+                    result_item = self._pid_import_result_item(pid, post=post, source="single")
                 except ChatError as exc:
-                    results_by_pid[pid] = {"pid": pid, "status": "failed", "error": exc.message}
+                    post = None
+                    result_item = self._pid_import_result_item(pid, status="failed", error=exc.message, source="single")
                 except Exception as exc:
-                    results_by_pid[pid] = {"pid": pid, "status": "failed", "error": str(exc)}
+                    post = None
+                    result_item = self._pid_import_result_item(pid, status="failed", error=str(exc), source="single")
+                finally:
+                    latency = time.time() - pid_started_at
+                    result_item["latency"] = latency
+                    with progress_lock:
+                        active_count = max(0, active_count - 1)
+                        last_latency = latency
+                        total_latency += latency
+                        latency_samples += 1
+                        results_by_pid[pid] = result_item
+                        if post and not post.get("deleted"):
+                            fetched_posts.append(post)
+                        if result_item["status"] in progress_counts:
+                            progress_counts[result_item["status"]] += 1
+                        completed += 1
+                        mark_recent(recent_complete_times, time.time())
+                        emit_progress(completed_count=completed, current_pid=pid, result=result_item)
+
+                    pid_queue.task_done()
+
+        if remaining_pids:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                worker_futures = [executor.submit(import_worker) for _ in range(max_workers)]
+                for future in as_completed(worker_futures):
+                    future.result()
+
+        if cache_enqueued > cache_written + cache_write_failed:
+            emit_progress(completed_count=completed, stage="cache_flush")
+        for _ in cache_threads:
+            cache_queue.put(cache_sentinel)
+        cache_queue.join()
+        for thread in cache_threads:
+            thread.join(timeout=1.0)
 
         self.upsert_posts(fetched_posts)
         results = [results_by_pid[pid] for pid in pids]
@@ -1562,7 +2302,9 @@ class LocalIndex:
         deleted = sum(1 for item in results if item["status"] == "deleted")
         failed = sum(1 for item in results if item["status"] == "failed")
         elapsed = time.time() - started_at
-        MAINTENANCE_BRIDGE.status = f"批量导入完成：成功 {fetched}，已删除 {deleted}，失败 {failed}"
+        progress_counts.update({"fetched": fetched, "deleted": deleted, "failed": failed})
+        emit_progress(completed_count=len(pids), stage="done")
+        avg_latency = total_latency / latency_samples if latency_samples else 0.0
         return {
             "ok": True,
             "pids": pids,
@@ -1573,11 +2315,54 @@ class LocalIndex:
                 "deleted": deleted,
                 "failed": failed,
                 "max_workers": max_workers,
+                "request_rate_limit": request_rate_limit,
+                "started": started_count,
+                "peak_active": peak_active_count,
+                "api_requests": api_request_count,
+                "cache_hits": max(0, started_count - api_request_count),
+                "cache_writes_queued": cache_enqueued,
+                "cache_writes_done": cache_written,
+                "cache_write_failed": cache_write_failed,
+                "cache_write_threads": cache_write_threads,
+                "cache_writer_errors": cache_writer_errors,
+                "worker_clients": worker_client_count,
+                "worker_request_timeout": worker_request_timeout,
+                "feed_enabled": bool(feed_stats.get("enabled")),
+                "feed_requests_started": feed_stats.get("requests_started", 0),
+                "feed_active_requests": feed_stats.get("active_requests", 0),
+                "feed_requested_pages": feed_stats.get("requested_pages", 0),
+                "feed_returned_pages": feed_stats.get("returned_pages", 0),
+                "feed_resolved": feed_stats.get("resolved", 0),
+                "feed_hits": feed_stats.get("hits", 0),
+                "feed_deleted": feed_stats.get("deleted", 0),
+                "feed_pages": feed_stats.get("pages", 0),
+                "feed_api_requests": feed_stats.get("api_requests", 0),
+                "feed_source": feed_stats.get("source", ""),
+                "feed_elapsed": feed_stats.get("elapsed", 0.0),
+                "feed_stop_reason": feed_stats.get("stop_reason", ""),
+                "fallback_requested": len(remaining_pids),
+                "api_request_rate": api_request_count / max(0.001, elapsed),
+                "api_request_rate_recent": len(recent_request_times) / recent_window,
+                "start_rate": started_count / max(0.001, elapsed),
+                "complete_rate": len(pids) / max(0.001, elapsed),
+                "complete_rate_recent": len(recent_complete_times) / recent_window,
+                "recent_window": recent_window,
+                "avg_latency": avg_latency,
+                "last_latency": last_latency,
                 "comment_preview_limit": PID_IMPORT_COMMENT_PREVIEW_LIMIT,
                 "elapsed": elapsed,
             },
             "stats": self.stats,
         }
+
+    def import_pids_from_input(self, text="", range_start=None, range_end=None, progress_callback=None):
+        return self.import_pids(
+            self.build_pid_import_pids(text=text, range_start=range_start, range_end=range_end),
+            progress_callback=progress_callback,
+        )
+
+    def import_pids_from_text(self, text):
+        return self.import_pids_from_input(text=text)
 
     @staticmethod
     def _infer_day_coverage(day_key, hours, count, first_ts, last_ts):
@@ -1743,11 +2528,15 @@ class LocalIndex:
         }
 
     def load_comments(self, pid, existing):
-        comments = list(existing or [])
+        comments = [normalize_comment(item) for item in (existing or []) if isinstance(item, dict)]
         path = COMMENT_CACHE_DIR / f"{pid}.json"
         payload = read_json(path)
+        cached_comments = []
         if isinstance(payload, dict) and isinstance(payload.get("comments"), list):
-            comments = [normalize_comment(item) for item in payload["comments"] if isinstance(item, dict)]
+            cached_comments = [normalize_comment(item) for item in payload["comments"] if isinstance(item, dict)]
+        elif isinstance(payload, list):
+            cached_comments = [normalize_comment(item) for item in payload if isinstance(item, dict)]
+        comments = cached_comments + comments
         seen = set()
         unique = []
         for comment in comments:
@@ -1881,8 +2670,78 @@ def get_request_max_parallel():
     return max(1, to_int(getattr(cfg, "REQUEST_MAX_PARALLEL", 20), 20))
 
 
+def get_request_max_requests_per_second():
+    try:
+        import config_private as cfg
+    except ImportError:
+        import config as cfg
+    try:
+        return max(0.1, float(getattr(cfg, "REQUEST_MAX_REQUESTS_PER_SECOND", 40.0)))
+    except Exception:
+        return 40.0
+
+
+def get_treehole_request_timeout_hint():
+    try:
+        import config_private as cfg
+    except ImportError:
+        import config as cfg
+    timeout_cfg = getattr(cfg, "TREEHOLE_REQUEST_TIMEOUT", (10, 30))
+    try:
+        if isinstance(timeout_cfg, (list, tuple)) and timeout_cfg:
+            timeout_values = [float(value) for value in timeout_cfg if value]
+            return max(timeout_values) if timeout_values else 30.0
+        return float(timeout_cfg or 30)
+    except Exception:
+        return 30.0
+
+
 def get_pid_import_max_parallel():
-    return get_request_max_parallel()
+    try:
+        import config_private as cfg
+    except ImportError:
+        import config as cfg
+    default_parallel = max(
+        get_request_max_parallel(),
+        int(get_request_max_requests_per_second() * max(1.0, get_treehole_request_timeout_hint())),
+    )
+    return max(1, to_int(getattr(cfg, "PID_IMPORT_MAX_PARALLEL", default_parallel), default_parallel))
+
+
+def get_pid_import_request_rate_limit():
+    return get_request_max_requests_per_second()
+
+
+def get_pid_import_request_timeout():
+    try:
+        import config_private as cfg
+    except ImportError:
+        import config as cfg
+    return getattr(cfg, "PID_IMPORT_REQUEST_TIMEOUT", getattr(cfg, "TREEHOLE_REQUEST_TIMEOUT", (10, 30)))
+
+
+def get_pid_import_cache_write_threads():
+    try:
+        import config_private as cfg
+    except ImportError:
+        import config as cfg
+    return max(1, to_int(getattr(cfg, "PID_IMPORT_CACHE_WRITE_THREADS", 4), 4))
+
+
+def get_pid_import_feed_page_limit():
+    try:
+        import config_private as cfg
+    except ImportError:
+        import config as cfg
+    return max(1, min(500, to_int(getattr(cfg, "PID_IMPORT_FEED_PAGE_LIMIT", 500), 500)))
+
+
+def get_pid_import_feed_max_page_workers():
+    try:
+        import config_private as cfg
+    except ImportError:
+        import config as cfg
+    return max(1, to_int(getattr(cfg, "PID_IMPORT_FEED_MAX_PAGE_WORKERS", 20), 20))
 
 
 def response_error_text(payload):
@@ -2289,6 +3148,149 @@ class AgentJobManager:
                 self.transcript.set_active(None)
 
 
+class PidImportJobManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs = {}
+
+    def create(self, payload):
+        if not isinstance(payload, dict):
+            payload = {}
+        pids = INDEX.build_pid_import_pids(
+            text=payload.get("text", ""),
+            range_start=payload.get("range_start"),
+            range_end=payload.get("range_end"),
+        )
+        job_id = f"pid-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        now = time.time()
+        job = {
+            "id": job_id,
+            "status": "queued",
+            "created_at": now,
+            "updated_at": now,
+            "pids": pids,
+            "total": len(pids),
+            "progress": {
+                "stage": "queued",
+                "total": len(pids),
+                "completed": 0,
+                "current_pid": None,
+                "fetched": 0,
+                "deleted": 0,
+                "failed": 0,
+                "elapsed": 0,
+                "message": f"等待批量导入 {len(pids)} 个 PID",
+            },
+            "results": [],
+            "summary": None,
+            "stats": None,
+        }
+        with self.lock:
+            self._prune_locked()
+            self.jobs[job_id] = job
+
+        thread = threading.Thread(target=self._run, args=(job_id, pids), daemon=True)
+        thread.start()
+        return self._public(job)
+
+    def get(self, job_id):
+        with self.lock:
+            job = self.jobs.get(job_id)
+            return self._public(job) if job else None
+
+    def _public(self, job):
+        public = dict(job)
+        public.pop("pids", None)
+        results = list(public.get("results") or [])
+        public["result_count"] = len(results)
+        if len(results) > PID_IMPORT_RESULT_PREVIEW_LIMIT:
+            public["results"] = results[:PID_IMPORT_RESULT_PREVIEW_LIMIT]
+        return public
+
+    def _prune_locked(self):
+        now = time.time()
+        stale_ids = [
+            job_id
+            for job_id, job in self.jobs.items()
+            if job.get("status") in {"done", "error"} and now - job.get("updated_at", now) > PID_IMPORT_JOB_RETENTION_SECONDS
+        ]
+        for job_id in stale_ids:
+            self.jobs.pop(job_id, None)
+
+    def _update(self, job_id, **updates):
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job:
+                return None
+            job.update(updates)
+            job["updated_at"] = time.time()
+            return self._public(job)
+
+    def _update_progress(self, job_id, progress):
+        progress = dict(progress or {})
+        result = progress.pop("result", None)
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job:
+                return
+            current = dict(job.get("progress") or {})
+            current.update(progress)
+            job["progress"] = current
+            if result and result.get("pid"):
+                job["results"].append(result)
+            job["updated_at"] = time.time()
+
+    def _run(self, job_id, pids):
+        started_at = time.time()
+        self._update(job_id, status="running", started_at=started_at)
+        try:
+            data = INDEX.import_pids(pids, progress_callback=lambda progress: self._update_progress(job_id, progress))
+            self._update(
+                job_id,
+                status="done",
+                completed_at=time.time(),
+                progress={
+                    **(self.get(job_id) or {}).get("progress", {}),
+                    "stage": "done",
+                    "completed": len(pids),
+                    "total": len(pids),
+                    "elapsed": time.time() - started_at,
+                },
+                results=data.get("results") or [],
+                summary=data.get("summary") or {},
+                stats=data.get("stats") or {},
+            )
+        except ChatError as exc:
+            self._update(
+                job_id,
+                status="error",
+                error=exc.message,
+                completed_at=time.time(),
+                progress={
+                    "stage": "error",
+                    "total": len(pids),
+                    "completed": len((self.get(job_id) or {}).get("results") or []),
+                    "elapsed": time.time() - started_at,
+                    "message": exc.message,
+                },
+            )
+        except Exception as exc:
+            message = f"PID 批量导入失败：{exc}"
+            self._update(
+                job_id,
+                status="error",
+                error=message,
+                completed_at=time.time(),
+                progress={
+                    "stage": "error",
+                    "total": len(pids),
+                    "completed": len((self.get(job_id) or {}).get("results") or []),
+                    "elapsed": time.time() - started_at,
+                    "message": message,
+                },
+            )
+
+
 AGENT_BRIDGE = AgentBridge()
 MAINTENANCE_BRIDGE = MaintenanceBridge()
 TRANSCRIPT = TranscriptStore(CHAT_HISTORY_FILE)
@@ -2299,6 +3301,7 @@ POST_METADATA = MetadataStore(POST_METADATA_FILE)
 
 INDEX = LocalIndex()
 INDEX.rebuild()
+PID_IMPORT_JOBS = PidImportJobManager()
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -2361,6 +3364,12 @@ class Handler(SimpleHTTPRequestHandler):
             if not job:
                 return self.send_json({"error": "not found"}, status=404)
             return self.send_json(job)
+        if parsed.path.startswith("/api/pids/import/jobs/"):
+            job_id = parsed.path.rsplit("/", 1)[-1]
+            job = PID_IMPORT_JOBS.get(job_id)
+            if not job:
+                return self.send_json({"error": "not found"}, status=404)
+            return self.send_json(job)
         return super().do_GET()
 
     def do_POST(self):
@@ -2378,7 +3387,14 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/pids/import":
             payload = self.read_json_body()
             try:
-                data = INDEX.import_pids_from_text(payload.get("text", ""))
+                if isinstance(payload, dict) and payload.get("async"):
+                    job = PID_IMPORT_JOBS.create(payload)
+                    return self.send_json({"ok": True, "job": job}, status=202)
+                data = INDEX.import_pids_from_input(
+                    text=payload.get("text", "") if isinstance(payload, dict) else "",
+                    range_start=payload.get("range_start") if isinstance(payload, dict) else None,
+                    range_end=payload.get("range_end") if isinstance(payload, dict) else None,
+                )
                 return self.send_json(data)
             except ChatError as exc:
                 return self.send_json({"error": exc.message}, status=exc.status)

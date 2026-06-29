@@ -34,6 +34,8 @@ const state = {
   workbenchStatusTimer: null,
   pendingPostReload: null,
   pidImportBusy: false,
+  pidImportJobId: "",
+  pidImportPollTimer: null,
   titleGenerationBusy: false,
 };
 
@@ -68,6 +70,8 @@ const nodes = {
   pidImportModal: document.querySelector("#pidImportModal"),
   pidImportForm: document.querySelector("#pidImportForm"),
   pidImportText: document.querySelector("#pidImportText"),
+  pidImportRangeStart: document.querySelector("#pidImportRangeStart"),
+  pidImportRangeEnd: document.querySelector("#pidImportRangeEnd"),
   pidImportCount: document.querySelector("#pidImportCount"),
   pidImportChips: document.querySelector("#pidImportChips"),
   pidImportResult: document.querySelector("#pidImportResult"),
@@ -85,6 +89,7 @@ const nodes = {
 };
 
 const LAYOUT_STORAGE_KEY = "treehole-layout-v1";
+const PID_IMPORT_PREVIEW_CHIP_LIMIT = 80;
 
 function icon(name) {
   return `<svg class="icon"><use href="#icon-${name}"></use></svg>`;
@@ -92,6 +97,11 @@ function icon(name) {
 
 function formatPid(pid) {
   return `#${pid}`;
+}
+
+function formatDecimal(value, digits = 1) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(digits) : (0).toFixed(digits);
 }
 
 function pad2(value) {
@@ -172,6 +182,72 @@ function extractPidsFromText(value) {
     match = regex.exec(text);
   }
   return pids;
+}
+
+function parsePidNumber(value) {
+  const text = normalizePidDigits(value).trim();
+  if (!text || !/^\d{1,10}$/.test(text)) return null;
+  const pid = Number.parseInt(text, 10);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
+function parsePidRange(startValue, endValue) {
+  const startText = normalizePidDigits(startValue).trim();
+  const endText = normalizePidDigits(endValue).trim();
+  if (!startText && !endText) return { count: 0, error: "" };
+  if (!startText || !endText) return { count: 0, error: "请同时填写 PID 起点和终点" };
+
+  const startPid = parsePidNumber(startText);
+  const endPid = parsePidNumber(endText);
+  if (!startPid || !endPid) return { count: 0, error: "PID 区间只支持正整数" };
+
+  const count = Math.abs(endPid - startPid) + 1;
+  const step = endPid >= startPid ? 1 : -1;
+  return { startPid, endPid, step, count, error: "" };
+}
+
+function rangeIncludesPid(range, pid) {
+  if (!range.count) return false;
+  return range.step > 0
+    ? pid >= range.startPid && pid <= range.endPid
+    : pid <= range.startPid && pid >= range.endPid;
+}
+
+function buildPidImportPreview() {
+  const previewPids = [];
+  const seen = new Set();
+  let total = 0;
+
+  function append(items) {
+    for (const item of items || []) {
+      const pid = Number.parseInt(item, 10);
+      if (!Number.isFinite(pid) || pid <= 0 || seen.has(pid)) continue;
+      seen.add(pid);
+      total += 1;
+      if (previewPids.length < PID_IMPORT_PREVIEW_CHIP_LIMIT) {
+        previewPids.push(pid);
+      }
+    }
+  }
+
+  append(extractPidsFromText(nodes.pidImportText.value));
+  const range = parsePidRange(nodes.pidImportRangeStart.value, nodes.pidImportRangeEnd.value);
+  if (range.error) return { pids: previewPids, count: total, error: range.error };
+
+  if (range.count) {
+    let duplicateCount = 0;
+    for (const pid of seen) {
+      if (rangeIncludesPid(range, pid)) duplicateCount += 1;
+    }
+    total += range.count - duplicateCount;
+
+    for (let pid = range.startPid; previewPids.length < PID_IMPORT_PREVIEW_CHIP_LIMIT; pid += range.step) {
+      if (!seen.has(pid)) previewPids.push(pid);
+      if (pid === range.endPid) break;
+    }
+  }
+
+  return { pids: previewPids, count: total, error: "" };
 }
 
 function setWorkbenchStatus(text, { timeout = 3200 } = {}) {
@@ -360,38 +436,48 @@ function renderCalendar() {
 function setPidImportBusy(isBusy) {
   state.pidImportBusy = isBusy;
   nodes.pidImportText.disabled = isBusy;
-  nodes.pidImportButton.disabled = isBusy;
-  nodes.pidImportSubmitButton.textContent = isBusy ? "抓取中" : "提取并抓取";
+  nodes.pidImportRangeStart.disabled = isBusy;
+  nodes.pidImportRangeEnd.disabled = isBusy;
+  nodes.pidImportButton.disabled = false;
+  nodes.pidImportButton.classList.toggle("is-busy", isBusy);
+  nodes.pidImportButton.title = isBusy ? "查看批量抓取进度" : "批量抓取 PID";
+  nodes.pidImportCancelButton.textContent = isBusy ? "收起" : "取消";
+  nodes.pidImportSubmitButton.textContent = isBusy ? "抓取中" : "批量抓取";
   renderPidImportPreview();
 }
 
 function renderPidImportPreview() {
-  const pids = extractPidsFromText(nodes.pidImportText.value);
-  nodes.pidImportCount.textContent = `${pids.length} 个 PID`;
-  nodes.pidImportSubmitButton.disabled = state.pidImportBusy || !pids.length;
+  const preview = buildPidImportPreview();
+  nodes.pidImportCount.textContent = `${preview.count} 个 PID`;
+  nodes.pidImportSubmitButton.disabled = state.pidImportBusy || !preview.count || Boolean(preview.error);
 
-  if (!pids.length) {
-    nodes.pidImportChips.innerHTML = `<span class="pid-import-empty">暂无 PID</span>`;
-    return pids;
+  if (preview.error) {
+    nodes.pidImportChips.innerHTML = `<span class="pid-import-empty">${escapeHtml(preview.error)}</span>`;
+    return preview;
   }
 
-  const visible = pids.slice(0, 80).map((pid) => `<span class="pid-chip">${formatPid(pid)}</span>`);
-  if (pids.length > 80) {
-    visible.push(`<span class="pid-chip">+${pids.length - 80}</span>`);
+  if (!preview.count) {
+    nodes.pidImportChips.innerHTML = `<span class="pid-import-empty">暂无 PID</span>`;
+    return preview;
+  }
+
+  const visible = preview.pids
+    .slice(0, PID_IMPORT_PREVIEW_CHIP_LIMIT)
+    .map((pid) => `<span class="pid-chip">${formatPid(pid)}</span>`);
+  if (preview.count > PID_IMPORT_PREVIEW_CHIP_LIMIT) {
+    visible.push(`<span class="pid-chip">+${preview.count - PID_IMPORT_PREVIEW_CHIP_LIMIT}</span>`);
   }
   nodes.pidImportChips.innerHTML = visible.join("");
-  return pids;
+  return preview;
 }
 
-function renderPidImportResults(data) {
-  const summary = data.summary || {};
-  const results = data.results || [];
+function renderPidImportRows(results) {
   const statusText = {
     fetched: "已抓取",
     deleted: "已删除",
     failed: "失败",
   };
-  const rows = results
+  return (results || [])
     .slice(0, 120)
     .map((item) => {
       const status = item.status || "failed";
@@ -410,13 +496,221 @@ function renderPidImportResults(data) {
       `;
     })
     .join("");
-  const overflow = results.length > 120 ? `<div class="pid-import-row-title">还有 ${results.length - 120} 条结果未展开</div>` : "";
-  const preview = summary.comment_preview_limit ? `，每帖评论预览 ${summary.comment_preview_limit} 条` : "";
-  nodes.pidImportResult.innerHTML = `
-    <div class="pid-import-summary">
-      完成 ${summary.requested || results.length} 个：已抓取 ${summary.fetched || 0}，已删除 ${summary.deleted || 0}，失败 ${summary.failed || 0}${preview}
+}
+
+function finiteNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function pidImportStageLabel(job, done = false) {
+  const progress = job.progress || {};
+  const stage = progress.stage || "";
+  if (done || job.status === "done" || stage === "done") return "批量导入完成";
+  if (job.status === "queued") return "等待开始";
+  if (stage === "feed_materialize") return "正在整理帖子和缓存";
+  if (stage === "feed") {
+    const total = finiteNumber(progress.total || job.total || job.summary?.requested || 0);
+    if (total && finiteNumber(progress.feed_resolved) >= total) return "PID 覆盖完成，正在整理结果";
+    if (finiteNumber(progress.feed_resolved) > 0) return "正在覆盖 PID";
+    if (finiteNumber(progress.feed_returned_pages || progress.feed_api_requests) > 0) return "正在定位列表页";
+    return "正在请求列表页";
+  }
+  if (stage === "cache_flush") return "正在写入缓存";
+  return "批量导入中";
+}
+
+function pidImportMetric(label, value) {
+  if (value === "" || value === null || value === undefined) return "";
+  return `<span><b>${escapeHtml(label)}</b>${escapeHtml(value)}</span>`;
+}
+
+function buildPidImportProgressMarkup(job, { done = false } = {}) {
+  const progress = job.progress || {};
+  const summary = job.summary || {};
+  const total = finiteNumber(progress.total || job.total || summary.requested || 0);
+  const completedActual = finiteNumber(progress.completed, done && total ? total : 0);
+  const feedResolved = finiteNumber(progress.feed_resolved);
+  const feedCoverageComplete = progress.stage === "feed" && total > 0 && feedResolved >= total;
+  const isMaterializeStage = progress.stage === "feed_materialize";
+  const feedMaterialized = finiteNumber(progress.feed_materialized);
+  const feedMaterializeTotal = finiteNumber(progress.feed_materialize_total);
+  const isCacheFlushStage = progress.stage === "cache_flush";
+  const cacheQueued = finiteNumber(progress.cache_writes_queued);
+  const cacheDone = finiteNumber(progress.cache_writes_done);
+  const cacheQueue = finiteNumber(progress.cache_write_queue);
+  const feedRequestsStarted = finiteNumber(progress.feed_requests_started);
+  const feedActiveRequests = finiteNumber(progress.feed_active_requests);
+  const feedReturnedPages = finiteNumber(progress.feed_returned_pages || progress.feed_api_requests);
+  const feedProcessedPages = finiteNumber(progress.feed_pages);
+  const feedRequestedPages = finiteNumber(progress.feed_requested_pages);
+  const feedPageBasis = Math.max(feedRequestedPages, feedRequestsStarted, feedReturnedPages, feedProcessedPages);
+  const progressTotal = isMaterializeStage && feedMaterializeTotal
+    ? feedMaterializeTotal
+    : isCacheFlushStage && cacheQueued
+      ? cacheQueued
+      : total;
+  const completedRaw = progress.stage === "feed"
+    ? Math.max(completedActual, feedResolved)
+    : isMaterializeStage && feedMaterializeTotal
+      ? feedMaterialized
+      : isCacheFlushStage && cacheQueued
+        ? cacheDone
+      : completedActual;
+  const completed = progressTotal ? Math.min(Math.max(completedRaw, 0), progressTotal) : Math.max(completedRaw, 0);
+  const rawPercent = progressTotal ? (completed / progressTotal) * 100 : done ? 100 : 0;
+  const percent = progressTotal
+    ? completed >= progressTotal
+      ? 100
+      : Math.max(0, Math.min(99, Math.floor(rawPercent)))
+    : done
+      ? 100
+      : 0;
+  const isActiveFeed = progress.stage === "feed" && percent === 0 && feedRequestsStarted && !feedCoverageComplete;
+  const fillPercent = percent > 0 && percent < 2 ? 2 : isActiveFeed ? 1 : percent;
+  const fetched = finiteNumber(progress.fetched ?? summary.fetched);
+  const deleted = finiteNumber(progress.deleted ?? summary.deleted);
+  const failed = finiteNumber(progress.failed ?? summary.failed);
+  const title = pidImportStageLabel(job, done);
+  const active = finiteNumber(progress.active);
+  const maxWorkers = finiteNumber(progress.max_workers);
+  const started = finiteNumber(progress.started);
+  const apiRequests = finiteNumber(progress.api_requests);
+  const apiRequestRate = Number(progress.api_request_rate);
+  const apiRequestRateRecent = Number(progress.api_request_rate_recent);
+  const completeRate = finiteNumber(progress.complete_rate);
+  const completeRateRecent = Number(progress.complete_rate_recent);
+  const avgLatency = finiteNumber(progress.avg_latency, 0);
+  const recentWindow = finiteNumber(progress.recent_window, 10);
+  const headerExtra =
+    isMaterializeStage && feedMaterializeTotal
+      ? ` · 整理 ${feedMaterialized}/${feedMaterializeTotal}`
+      : isCacheFlushStage && cacheQueued
+      ? ` · 缓存 ${cacheDone}/${cacheQueued}`
+      : feedCoverageComplete
+      ? ` · 命中 ${progress.feed_hits || 0} · 删除 ${progress.feed_deleted || 0}`
+      : progress.stage === "feed" && feedRequestsStarted
+      ? ` · 返回页 ${feedReturnedPages}/${feedPageBasis || "?"}`
+      : "";
+  const feedMetrics = (feedCoverageComplete ? [
+    pidImportMetric("覆盖 PID", `${feedResolved}/${total || "?"}`),
+    pidImportMetric("命中帖子", progress.feed_hits || 0),
+    pidImportMetric("确认删除", progress.feed_deleted || 0),
+    feedProcessedPages ? pidImportMetric("处理页", feedProcessedPages) : "",
+    feedActiveRequests ? pidImportMetric("收尾请求", feedActiveRequests) : "",
+  ] : [
+    pidImportMetric("覆盖 PID", `${feedResolved}/${total || "?"}`),
+    pidImportMetric("命中帖子", progress.feed_hits || 0),
+    pidImportMetric("确认删除", progress.feed_deleted || 0),
+    feedRequestsStarted ? pidImportMetric("请求", `${feedRequestsStarted} 发出 / ${progress.feed_api_requests || 0} 返回`) : "",
+    feedActiveRequests ? pidImportMetric("活跃请求", feedActiveRequests) : "",
+    feedPageBasis ? pidImportMetric("返回页", `${feedReturnedPages}/${feedPageBasis}`) : "",
+    feedProcessedPages ? pidImportMetric("处理页", feedProcessedPages) : "",
+    Number.isFinite(apiRequestRateRecent)
+      ? pidImportMetric(`近${formatDecimal(recentWindow, 0)}秒请求`, `${formatDecimal(apiRequestRateRecent)}/s`)
+      : "",
+  ]);
+  const doneMetrics = [
+    pidImportMetric("成功", fetched),
+    pidImportMetric("已删除", deleted),
+    pidImportMetric("失败", failed),
+    progress.feed_enabled ? pidImportMetric("feed覆盖", `${feedResolved || completed}/${total || "?"}`) : "",
+    progress.feed_enabled ? pidImportMetric("feed命中", progress.feed_hits || fetched) : "",
+    progress.feed_enabled ? pidImportMetric("feed删除", progress.feed_deleted || deleted) : "",
+    pidImportMetric("耗时", `${formatDecimal(progress.elapsed, 1)}s`),
+  ];
+  const materializeMetrics = [
+    pidImportMetric("整理", `${feedMaterialized}/${feedMaterializeTotal || "?"}`),
+    pidImportMetric("命中帖子", progress.feed_hits || 0),
+    pidImportMetric("确认删除", progress.feed_deleted || 0),
+    cacheQueued ? pidImportMetric("缓存写入", `${cacheDone}/${cacheQueued}`) : "",
+    cacheQueue ? pidImportMetric("待写缓存", cacheQueue) : "",
+    feedProcessedPages ? pidImportMetric("处理页", feedProcessedPages) : "",
+  ];
+  const cacheFlushMetrics = [
+    pidImportMetric("缓存写入", `${cacheDone}/${cacheQueued || "?"}`),
+    cacheQueue ? pidImportMetric("待写缓存", cacheQueue) : "",
+    pidImportMetric("成功", fetched),
+    pidImportMetric("已删除", deleted),
+    pidImportMetric("失败", failed),
+    pidImportMetric("缓存线程", progress.cache_write_threads || ""),
+  ];
+  const workerMetrics = [
+    pidImportMetric("成功", fetched),
+    pidImportMetric("已删除", deleted),
+    pidImportMetric("失败", failed),
+    maxWorkers ? pidImportMetric("活跃", `${active}/${maxWorkers}`) : "",
+    started ? pidImportMetric("已启动", started) : "",
+    apiRequests || Number.isFinite(apiRequestRate) ? pidImportMetric("请求", `${formatDecimal(apiRequestRate)}/s`) : "",
+    Number.isFinite(apiRequestRateRecent)
+      ? pidImportMetric(`近${formatDecimal(recentWindow, 0)}秒请求`, `${formatDecimal(apiRequestRateRecent)}/s`)
+      : "",
+    pidImportMetric("完成", `${formatDecimal(completeRate)}/s`),
+    Number.isFinite(completeRateRecent)
+      ? pidImportMetric(`近${formatDecimal(recentWindow, 0)}秒完成`, `${formatDecimal(completeRateRecent)}/s`)
+      : "",
+    progress.feed_enabled ? pidImportMetric("feed覆盖", `${feedResolved}/${total || "?"}`) : "",
+    progress.fallback_requested ? pidImportMetric("fallback", progress.fallback_requested) : "",
+    progress.worker_clients ? pidImportMetric("clients", progress.worker_clients) : "",
+    progress.cache_write_queue ? pidImportMetric("cache", progress.cache_write_queue) : "",
+    pidImportMetric("均耗", `${formatDecimal(avgLatency, 2)}s`),
+    progress.request_rate_limit ? pidImportMetric("上限", `${formatDecimal(progress.request_rate_limit)}/s`) : "",
+  ];
+  const metrics = ((done || job.status === "done" || progress.stage === "done")
+    ? doneMetrics
+    : isMaterializeStage
+      ? materializeMetrics
+      : isCacheFlushStage
+        ? cacheFlushMetrics
+      : progress.stage === "feed"
+        ? feedMetrics
+        : workerMetrics)
+    .filter(Boolean)
+    .join("");
+  return `
+    <div class="pid-import-progress">
+      <div class="pid-import-progress-head">
+        <span>${escapeHtml(title)}</span>
+        <strong>${percent}% · ${completed}/${progressTotal || "?"}${escapeHtml(headerExtra)}</strong>
+      </div>
+      <div class="pid-import-meter${isActiveFeed ? " is-active" : ""}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">
+        <span style="width: ${fillPercent}%"></span>
+      </div>
+      <div class="pid-import-progress-stats">${metrics}</div>
     </div>
+  `;
+}
+
+function renderPidImportResults(data) {
+  const summary = data.summary || {};
+  const results = data.results || [];
+  const resultCount = Number(data.result_count || results.length);
+  const rows = renderPidImportRows(results);
+  const overflow = resultCount > 120 ? `<div class="pid-import-row-title">还有 ${resultCount - 120} 条结果未展开</div>` : "";
+  const preview = summary.comment_preview_limit ? `，每帖评论预览 ${summary.comment_preview_limit} 条` : "";
+  const progress = {
+    ...(data.progress || {}),
+    total: summary.requested || data.total || resultCount,
+    completed: summary.requested || data.total || resultCount,
+    fetched: summary.fetched,
+    deleted: summary.deleted,
+    failed: summary.failed,
+    message: `批量导入完成${preview}`,
+  };
+  nodes.pidImportResult.innerHTML = `
+    ${buildPidImportProgressMarkup({ ...data, progress }, { done: true })}
     ${rows || "暂无结果"}
+    ${overflow}
+  `;
+}
+
+function renderPidImportJob(job) {
+  const rows = renderPidImportRows(job.results || []);
+  const resultCount = Number(job.result_count || (job.results || []).length);
+  const overflow = resultCount > 120 ? `<div class="pid-import-row-title">还有 ${resultCount - 120} 条结果未展开</div>` : "";
+  nodes.pidImportResult.innerHTML = `
+    ${buildPidImportProgressMarkup(job, { done: job.status === "done" })}
+    ${rows || ""}
     ${overflow}
   `;
 }
@@ -424,40 +718,105 @@ function renderPidImportResults(data) {
 function openPidImportDialog() {
   nodes.pidImportModal.hidden = false;
   renderPidImportPreview();
-  requestAnimationFrame(() => nodes.pidImportText.focus());
+  if (state.pidImportBusy && state.pidImportJobId && !state.pidImportPollTimer) {
+    pollPidImportJob(state.pidImportJobId);
+  }
+  requestAnimationFrame(() => {
+    const target = state.pidImportBusy ? nodes.pidImportCloseButton : nodes.pidImportText;
+    target.focus();
+  });
 }
 
 function closePidImportDialog() {
   nodes.pidImportModal.hidden = true;
 }
 
-async function submitPidImport() {
-  const pids = renderPidImportPreview();
-  if (!pids.length || state.pidImportBusy) return;
+function stopPidImportPolling() {
+  if (state.pidImportPollTimer) {
+    clearTimeout(state.pidImportPollTimer);
+    state.pidImportPollTimer = null;
+  }
+}
 
+async function finishPidImportJob(job) {
+  renderPidImportResults(job);
+  state.stats = job.stats || state.stats;
+  state.selectedPid = null;
+  state.selectedPost = null;
+  await Promise.all([loadCollections(), loadCalendar()]);
+  await loadPosts({ reset: true, offset: 0 });
+  const summary = job.summary || {};
+  setWorkbenchStatus(`PID 导入完成：成功 ${(summary.fetched || 0) + (summary.deleted || 0)}，失败 ${summary.failed || 0}`);
+  state.pidImportJobId = "";
+  setPidImportBusy(false);
+}
+
+async function pollPidImportJob(jobId) {
+  if (!jobId || state.pidImportJobId !== jobId) return;
+  try {
+    const job = await fetchJson(`/api/pids/import/jobs/${encodeURIComponent(jobId)}`);
+    renderPidImportJob(job);
+    if (job.status === "done") {
+      stopPidImportPolling();
+      await finishPidImportJob(job);
+      return;
+    }
+    if (job.status === "error") {
+      stopPidImportPolling();
+      const message = job.error || job.progress?.message || "导入失败";
+      nodes.pidImportResult.innerHTML = `<div class="pid-import-summary">导入失败：${escapeHtml(message)}</div>`;
+      setWorkbenchStatus(`PID 导入失败：${message}`, { timeout: 5200 });
+      state.pidImportJobId = "";
+      setPidImportBusy(false);
+      return;
+    }
+    state.pidImportPollTimer = setTimeout(() => pollPidImportJob(jobId), 360);
+  } catch (error) {
+    stopPidImportPolling();
+    nodes.pidImportResult.innerHTML = `<div class="pid-import-summary">导入失败：${escapeHtml(error.message)}</div>`;
+    setWorkbenchStatus(`PID 导入失败：${error.message}`, { timeout: 5200 });
+    state.pidImportJobId = "";
+    setPidImportBusy(false);
+  }
+}
+
+async function submitPidImport() {
+  const preview = renderPidImportPreview();
+  if (!preview.count || preview.error || state.pidImportBusy) return;
+
+  stopPidImportPolling();
+  state.pidImportJobId = "";
   setPidImportBusy(true);
-  nodes.pidImportResult.textContent = `正在抓取 ${pids.length} 个 PID...`;
-  setWorkbenchStatus(`导入 ${pids.length} 个 PID 中`, { timeout: 0 });
+  nodes.pidImportResult.textContent = `正在准备 ${preview.count} 个 PID...`;
+  setWorkbenchStatus(`导入 ${preview.count} 个 PID 中`, { timeout: 0 });
 
   try {
     const data = await fetchJson("/api/pids/import", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: nodes.pidImportText.value }),
+      body: JSON.stringify({
+        async: true,
+        text: nodes.pidImportText.value,
+        range_start: nodes.pidImportRangeStart.value,
+        range_end: nodes.pidImportRangeEnd.value,
+      }),
     });
-    renderPidImportResults(data);
-    state.stats = data.stats || state.stats;
-    state.selectedPid = null;
-    state.selectedPost = null;
-    await Promise.all([loadCollections(), loadCalendar()]);
-    await loadPosts({ reset: true, offset: 0 });
-    const summary = data.summary || {};
-    setWorkbenchStatus(`PID 导入完成：成功 ${(summary.fetched || 0) + (summary.deleted || 0)}，失败 ${summary.failed || 0}`);
+    const job = data.job || {};
+    state.pidImportJobId = job.id || "";
+    renderPidImportJob(job);
+    if (job.status === "done") {
+      await finishPidImportJob(job);
+    } else if (state.pidImportJobId) {
+      state.pidImportPollTimer = setTimeout(() => pollPidImportJob(state.pidImportJobId), 220);
+    } else {
+      throw new Error("导入任务未返回 job id");
+    }
   } catch (error) {
     nodes.pidImportResult.innerHTML = `<div class="pid-import-summary">导入失败：${escapeHtml(error.message)}</div>`;
     setWorkbenchStatus(`PID 导入失败：${error.message}`, { timeout: 5200 });
-  } finally {
     setPidImportBusy(false);
+  } finally {
+    if (!state.pidImportJobId) setPidImportBusy(false);
   }
 }
 
@@ -1124,12 +1483,19 @@ nodes.pidImportCancelButton.addEventListener("click", () => {
 });
 
 nodes.pidImportModal.addEventListener("click", (event) => {
-  if (event.target === nodes.pidImportModal) closePidImportDialog();
+  if (event.target === nodes.pidImportModal && !state.pidImportBusy) closePidImportDialog();
 });
 
 nodes.pidImportText.addEventListener("input", () => {
   nodes.pidImportResult.textContent = "";
   renderPidImportPreview();
+});
+
+[nodes.pidImportRangeStart, nodes.pidImportRangeEnd].forEach((input) => {
+  input.addEventListener("input", () => {
+    nodes.pidImportResult.textContent = "";
+    renderPidImportPreview();
+  });
 });
 
 nodes.pidImportForm.addEventListener("submit", (event) => {
@@ -1179,6 +1545,7 @@ nodes.chatInput.addEventListener("keydown", (event) => {
 
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !nodes.pidImportModal.hidden) {
+    if (state.pidImportBusy) return;
     closePidImportDialog();
   }
 });

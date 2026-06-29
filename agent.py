@@ -328,6 +328,8 @@ class TreeholeRAGAgent:
         "执行规则：\n"
         "- 已知 PID 时优先用 get_post_by_pid，减少冗余检索\n"
         "- 需要评论细节时用 get_comments_by_pid，不要只停留在主帖标题级信息\n"
+        "- 没有当前问题的检索证据时，必须先调用 search_treehole，不能直接总结或只输出搜索计划\n"
+        "- 工具阶段如果需要搜索，必须返回 tool_calls，不要把工具调用写成自然语言列表\n"
         "- 优先在同一轮一次性返回多个 tool_calls（建议 4-8 个），减少模型往返次数\n"
         "- 仅当必须依赖上一批工具结果再决策时，才拆成下一轮调用\n"
         "- 若当前信息已足够支持结论，可直接总结，不需要机械分阶段\n"
@@ -463,7 +465,18 @@ class TreeholeRAGAgent:
         session = getattr(self.client, "session", None)
         if session is None:
             return
-        pool_size = max(1, int(REQUEST_MAX_PARALLEL))
+        timeout_cfg = getattr(_cfg, "TREEHOLE_REQUEST_TIMEOUT", (10, 30))
+        if isinstance(timeout_cfg, (list, tuple)) and timeout_cfg:
+            timeout_values = [float(value) for value in timeout_cfg if value]
+            timeout_hint = max(timeout_values) if timeout_values else 30.0
+        else:
+            timeout_hint = float(timeout_cfg or 30)
+        default_pid_import_parallel = max(
+            int(REQUEST_MAX_PARALLEL),
+            int(REQUEST_MAX_REQUESTS_PER_SECOND * max(1.0, timeout_hint)),
+        )
+        pid_import_parallel = int(getattr(_cfg, "PID_IMPORT_MAX_PARALLEL", default_pid_import_parallel))
+        pool_size = max(1, int(REQUEST_MAX_PARALLEL), pid_import_parallel)
         adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, pool_block=True)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
@@ -1090,7 +1103,14 @@ class TreeholeRAGAgent:
 
     def _save_pid_post_cache(self, pid: int, post: Optional[Dict[str, Any]]) -> None:
         """Persist one PID lookup result for later daily scans."""
-        comment_preview_version = PID_POST_CACHE_COMMENT_PREVIEW_VERSION if post else 0
+        comment_preview_version = 0
+        if post:
+            reply_hint = self._nonnegative_int(
+                post.get("comment_total", post.get("reply_count", post.get("reply", 0))),
+                0,
+            )
+            if reply_hint <= 0 or self._inline_comment_preview_count(post) > 0:
+                comment_preview_version = PID_POST_CACHE_COMMENT_PREVIEW_VERSION
         payload = {
             "pid": int(pid),
             "found": bool(post),
@@ -1143,6 +1163,9 @@ class TreeholeRAGAgent:
         max_comments: int = DEFAULT_COMMENTS_PER_POST,
         quiet: bool = False,
         use_cache: bool = True,
+        on_request_start=None,
+        cache_saver=None,
+        request_client=None,
     ) -> Optional[Dict[str, Any]]:
         """Fetch one post by pid and optionally hydrate comments."""
         pid = int(pid)
@@ -1177,14 +1200,17 @@ class TreeholeRAGAgent:
             if not quiet:
                 self._emit_info(f"Tool#{tool_id} get_post_by_pid 开始: pid={pid}")
             self._pid_fetch_rate_limiter.acquire()
-            result = self.client.get_post(pid)
+            if on_request_start:
+                on_request_start(pid)
+            client = request_client or self.client
+            result = client.get_post(pid, comment_limit=max_comments)
             if not result.get("success"):
-                self._save_pid_post_cache(pid, None)
+                (cache_saver or self._save_pid_post_cache)(pid, None)
                 if not quiet:
                     self._emit_info(f"Tool#{tool_id} get_post_by_pid 未找到: pid={pid}")
                 return None
             post = self._normalize_post_metadata(result.get("data", {}))
-            self._save_pid_post_cache(pid, post)
+            (cache_saver or self._save_pid_post_cache)(pid, post)
             if include_comments:
                 post["comments"] = self._load_comments_for_post(post, max_comments)
             if not quiet:
@@ -2608,6 +2634,7 @@ class TreeholeRAGAgent:
                     f"当前用户问题：{user_question}\n"
                     "请在预算内自主决定是先泛化还是先聚焦。优先一次性发出多条 tool_calls，提高效率；"
                     "如果当前已有证据足够，也可以直接停止调用工具并准备总结。"
+                    "如果没有与当前问题直接相关的证据，第一轮必须返回 tool_calls，不要用普通文本列搜索计划。"
                 ),
             }
         )
@@ -2704,6 +2731,85 @@ class TreeholeRAGAgent:
             return args if isinstance(args, dict) else {}
         except Exception:
             return {}
+
+    @staticmethod
+    def _normalize_initial_search_keyword(keyword: str) -> str:
+        keyword = re.sub(r"\s+", " ", str(keyword or "")).strip()
+        keyword = re.sub(
+            r"^(请|麻烦|帮我|能不能|可以)?\s*(找一下|找找|搜一下|搜索一下|查一下|看看|讲讲|说说|了解一下)\s*",
+            "",
+            keyword,
+        )
+        keyword = re.sub(r"^(关于|有关)\s*", "", keyword)
+        keyword = re.sub(r"^[的地得和与跟及]+|[的地得和与跟及]+$", "", keyword)
+        return keyword.strip(" ，。！？?；;：:")
+
+    def _build_initial_search_tool_calls(self, user_question: str, limit: int) -> List[Dict[str, Any]]:
+        """Build a small explicit search batch when the LLM fails to emit tool_calls."""
+        if limit <= 0:
+            return []
+
+        raw_question = str(user_question or "").strip()
+        cleaned_question = self._normalize_initial_search_keyword(raw_question)
+        candidates: List[str] = []
+
+        ascii_tokens: List[str] = []
+        seen_ascii: Set[str] = set()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]+", raw_question):
+            normalized = token.lower()
+            if normalized not in seen_ascii:
+                seen_ascii.add(normalized)
+                ascii_tokens.append(normalized)
+
+        if len(ascii_tokens) >= 2:
+            candidates.append(" ".join(ascii_tokens[:2]))
+        candidates.extend(ascii_tokens[:4])
+
+        alias_map = {
+            "sms": ["数院", "数学科学学院"],
+            "gsm": ["光华", "光华管理学院"],
+        }
+        for token in ascii_tokens:
+            candidates.extend(alias_map.get(token, []))
+        if {"sms", "gsm"}.issubset(set(ascii_tokens)):
+            candidates.extend(["数院 光华", "sms 光华", "gsm 数院"])
+
+        if cleaned_question:
+            compact_question = re.sub(r"[和与跟及]+", " ", cleaned_question).strip()
+            if 2 <= len(compact_question) <= 24:
+                candidates.append(compact_question)
+
+        for token in extract_keywords(cleaned_question):
+            normalized = self._normalize_initial_search_keyword(token)
+            if len(normalized) >= 2:
+                candidates.append(normalized)
+
+        tool_calls: List[Dict[str, Any]] = []
+        seen_keywords: Set[str] = set()
+        for keyword in candidates:
+            keyword = self._normalize_initial_search_keyword(keyword)
+            if not keyword or keyword in seen_keywords:
+                continue
+            seen_keywords.add(keyword)
+            tool_calls.append(
+                {
+                    "id": f"fallback_search_{len(tool_calls) + 1}",
+                    "type": "function",
+                    "function": {
+                        "name": "search_treehole",
+                        "arguments": json.dumps(
+                            {
+                                "keyword": keyword,
+                                "reason": "模型未返回工具调用时的初始检索",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            )
+            if len(tool_calls) >= limit:
+                break
+        return tool_calls
 
     def _execute_tool_calls_batch(
         self,
@@ -2952,6 +3058,7 @@ class TreeholeRAGAgent:
         search_results_per_call = int(profile_cfg["search_results_per_call"])
         search_used = 0
         tool_round = 0
+        empty_tool_retries = 0
 
         while tool_round < max_tool_rounds:
             self._inject_task_memory_snapshot(messages)
@@ -2963,7 +3070,38 @@ class TreeholeRAGAgent:
 
             tool_calls = response.get("tool_calls") or []
             if not tool_calls:
-                break
+                if search_used == 0 and not working_posts:
+                    if empty_tool_retries == 0:
+                        empty_tool_retries += 1
+                        self._emit_info("模型未返回工具调用；当前无检索证据，强制重试工具检索。")
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "当前问题还没有任何检索证据。下一轮 assistant 必须返回 tool_calls，"
+                                    "至少调用 search_treehole；不要用自然语言列出搜索计划。"
+                                ),
+                            }
+                        )
+                        continue
+
+                    fallback_limit = min(6, max(0, search_budget - search_used))
+                    tool_calls = self._build_initial_search_tool_calls(user_question, fallback_limit)
+                    if tool_calls:
+                        keywords = [
+                            self._parse_tool_call_args(tool_call).get("keyword", "")
+                            for tool_call in tool_calls
+                        ]
+                        self._emit_info(
+                            "模型仍未返回工具调用；改用初始关键词检索: "
+                            + ", ".join(keyword for keyword in keywords if keyword)
+                        )
+                        response = {"content": None, "reasoning_content": None}
+                    else:
+                        self._emit_info("模型未返回工具调用，且无法从问题中提取有效关键词；本轮没有检索证据。")
+                        break
+                else:
+                    break
 
             tool_round += 1
             messages.append(
@@ -3049,8 +3187,20 @@ class TreeholeRAGAgent:
         )
         messages.append(
             {
+                "role": "system",
+                "content": "最终回答阶段不再提供工具。不要输出或承诺工具调用，只能基于最终上下文回答。",
+            }
+        )
+        final_instruction = "请基于以上已检索内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造；如果证据不足请明确说明。"
+        if not final_context_posts:
+            final_instruction = (
+                "本轮没有可用的检索结果。请直接说明没有检索到足够证据，无法回答该问题；"
+                "不要列搜索计划，不要声称将调用工具，也不要编造树洞内容。"
+            )
+        messages.append(
+            {
                 "role": "user",
-                "content": "请基于以上已检索内容，用中文给出完整、有条理的回答。只使用已检索到的内容，不要编造；如果证据不足请明确说明。",
+                "content": final_instruction,
             }
         )
 
